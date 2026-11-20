@@ -62,7 +62,7 @@ export function LocalMediaPreview({ hint, onRefresh, refreshing=false }: { hint:
     <div ref={holder} className="mt-2 min-h-10 max-w-full">
       {!result && (
         <div className="rounded-xl bg-muted/50 px-4 py-5 text-xs text-muted-foreground">
-          正在读取本地{hint.kind === "voice" ? "语音" : "图片 / 表情"}…
+          正在读取本地{hint.kind === "file" ? "音频" : hint.kind === "voice" ? "语音" : "图片 / 表情"}…
         </div>
       )}
       {result?.url && result.kind === "image" && (
@@ -114,6 +114,7 @@ export function LocalMediaPreview({ hint, onRefresh, refreshing=false }: { hint:
           preload="metadata"
           src={result.url}
           className="max-w-full"
+          onError={() => setResult({ notice: "无法播放这个音频，请导出后查看。" })}
         />
       )}
       {result?.notice && (

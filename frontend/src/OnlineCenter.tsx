@@ -23,7 +23,7 @@ const markdownComponents:Components={
   table:({children})=><div className="online-table"><table>{children}</table></div>,
 }
 const markdownPlugins=[remarkGfm]
-export const OnlineMarkdown=memo(function OnlineMarkdown({body}:{body:string}){
+const OnlineMarkdown=memo(function OnlineMarkdown({body}:{body:string}){
   return <div className="online-markdown"><ReactMarkdown skipHtml remarkPlugins={markdownPlugins} components={markdownComponents}>{body}</ReactMarkdown></div>
 })
 

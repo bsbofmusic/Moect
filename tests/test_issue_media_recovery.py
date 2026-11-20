@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.account_exporting import export_moments
+from core.exporting import export_session
 from core.image_recovery import recent_image_samples, recover_local_images
 from core.resources import ResourceStore
 from core.service import Service
@@ -131,17 +132,22 @@ class IssueMediaRecoveryTests(unittest.TestCase):
 
     def test_chat_emoji_reuses_the_same_local_cache_as_sticker_export(self):
         output = self.root / 'emoji';output.mkdir()
+        message = {'kind':'emoji', 'sender_wxid':'', 'text':'[动画表情]', 'create_time':1800000000,
+                   '_media':{'hashes':[FAVORITE]}, 'extra':{}}
         with self.service.read_archive() as archive:
-            decoder = StickerCache(archive.data, None, lambda: None)
-            decoder.key_path.parent.mkdir(parents=True, exist_ok=True)
-            decoder.key_path.write_bytes(self.emoticon_key)
+            with patch.object(archive, 'messages', return_value=iter([message])), \
+                 patch('core.sticker_cache.discover_emoticon_key', return_value=self.emoticon_key) as recover:
+                result = export_session(archive, {'username':SESSION, 'display':'合成会话'}, {'format':'json'},
+                                        output, ASSETS, lambda _: None, lambda: None)
+                recover.assert_called_once()
+            exported = json.loads(Path(result['path']).read_text(encoding='utf-8'))['messages'][0]
+            self.assertEqual((output/exported['resources'][0]['path']).read_bytes(), PNG)
             store = ResourceStore(archive.data, SESSION, output, preview=True)
             try:
                 with patch.object(store, '_download', side_effect=AssertionError('Local cache must not download')):
-                    message = store.enrich({'kind':'emoji','sender_wxid':'','text':'[动画表情]',
-                                            '_media':{'hashes':[FAVORITE]},'extra':{}})
-                self.assertEqual(message['resources'][0]['kind'], 'image')
-                self.assertEqual((output / message['resources'][0]['path']).read_bytes(), PNG)
+                    previewed = store.enrich(message)
+                self.assertEqual(previewed['resources'][0]['kind'], 'image')
+                self.assertEqual((output / previewed['resources'][0]['path']).read_bytes(), PNG)
                 self.assertEqual(store.sticker_decoder.scan_timeout, 0)
             finally:
                 store.close()

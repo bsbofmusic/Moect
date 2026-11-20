@@ -13,11 +13,11 @@ SESSIONS = [
 
 
 class DemoArchive:
-    def __init__(self, library=None):
-        self.library = library
-
     def close(self):
         pass
+
+    def has_session(self, username):
+        return any(username == session[0] for session in SESSIONS)
 
     def sessions(self):
         base = int(datetime(2026, 10, 30, 15, 30).timestamp())
@@ -25,7 +25,7 @@ class DemoArchive:
                      last_time=base-i*2700, sort_time=base-i*2700, has_messages=True,
                      unread=0, initial=a) for i, (u, n, t, s, a) in enumerate(SESSIONS)]
 
-    def messages(self, session, options=None, descending=False, before=None, cancel=None):
+    def messages(self, session, options=None, descending=False, before=None, cancel=None, on_scan=None):
         options = options or {}
         base = int(datetime(2026, 10, 30, 10, 10).timestamp())
         text = [
@@ -55,9 +55,13 @@ class DemoArchive:
                              sender=sender, sender_wxid='demo_me' if me else 'demo_friend',
                              is_sender=me, text=content, content=content, kind=kind, extra={},
                              session=session, _cursor=key))
-        for msg in reversed(rows) if descending else rows:
+        for scanned, msg in enumerate(reversed(rows) if descending else rows):
             if cancel: cancel()
+            if on_scan is not None: on_scan(scanned)
             yield msg
+
+    def message_count(self, session, options, cancel=lambda: None):
+        return sum(1 for _ in self.messages(session, options, cancel=cancel))
 
     def page(self, session, options=None, before=None, limit=60):
         rows = list(self.messages(session, options, descending=True, before=before))

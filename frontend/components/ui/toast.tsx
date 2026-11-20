@@ -5,7 +5,7 @@
  * @repository github.com/shuakami/toast
  */
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react"
-import { AnimatePresence, motion } from "motion/react"
+import { AnimatePresence, motion } from "framer-motion"
 import { X } from "lucide-react"
 
 export type ToastType = "info" | "success" | "warning" | "error" | "loading"

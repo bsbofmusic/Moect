@@ -1,5 +1,6 @@
 """Database cache, voice candidates and retained groups: synthetic data only."""
 import json
+import hashlib
 import sqlite3
 import tempfile
 import unittest
@@ -9,11 +10,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.data import Archive
+from core.avatars import AvatarStore
 from core.resources import ResourceStore
 from core.service import Service
 from tests.test_audio_and_connection import silk_fixture
 from tests.test_core import SESSION
-from tests.test_resources import ASSETS,media_fixture
+from tests.test_resources import ASSETS,PNG,media_fixture
 from wx4 import key
 from wx4.common import PAGE_SZ,hmac_for_page1
 
@@ -137,4 +139,28 @@ class VoiceAndGroupTests(unittest.TestCase):
         service=Service(ASSETS,self.root/'service');self.addCleanup(service.shutdown)
         service.library=self.library
         self.assertTrue(service.avatar(source)['url'].startswith('data:image/png'))
+        self.assertEqual(service.sessions()[0]['avatar_url'], source)
+        with patch.object(service, 'archive', side_effect=AssertionError('Avatar must use its own database only')):
+            self.assertTrue(service.avatar(source)['url'].startswith('data:image/png'))
         self.assertEqual(service.avatar(source.replace(source.split(':')[1],'0'*16))['url'],'')
+        with patch.object(Archive,'sessions',side_effect=AssertionError('Known session must not rebuild the list')):
+            self.assertGreater(service.qce_preview({'peer':{'peerUid':SESSION}})['totalCount'],0)
+            media=service.preview_media({'session':SESSION,'shard':0,'local_id':10,'server_id':'10'})
+            self.assertTrue(media['url'].startswith('data:image/png'))
+
+    def test_legacy_downloaded_avatars_still_work_after_cache_paths_unify(self):
+        service = Service(ASSETS, self.root/'service')
+        self.addCleanup(service.shutdown)
+        service.library = self.library
+        url = 'https://qpic.cn/synthetic'
+        name = hashlib.sha256(url.encode()).hexdigest()+'.img'
+        legacy = Path(self.library['root']).parent/'avatar-cache'/name
+        legacy.parent.mkdir()
+        legacy.write_bytes(PNG)
+        with service.read_archive() as archive:
+            store = AvatarStore.for_archive(archive.data)
+            self.assertEqual(store.cache, service.storage_root/'avatar-cache')
+            with patch('core.avatars.urllib.request.build_opener', side_effect=AssertionError('Cached avatar must work offline')):
+                self.assertEqual(store.url_blob(url, download=True), PNG)
+                self.assertTrue(service.avatar(url)['url'].startswith('data:image/png'))
+            self.assertFalse((store.cache/name).exists())

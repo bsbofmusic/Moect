@@ -1,4 +1,4 @@
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 # Change only when a redesigned guide needs to be shown again.
 TUTORIAL_REVISION = '1.3.0'
 APP_NAME = 'Moect'

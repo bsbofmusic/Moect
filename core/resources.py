@@ -10,15 +10,17 @@ import re
 import sqlite3
 import ssl
 import tempfile
+import threading
 import time
+import uuid
 import urllib.request
 import urllib.error
 from itertools import chain
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from urllib.parse import urlparse
 from .avatars import AvatarStore,image_type
-from .media_codec import ImageKeys,MediaCodec,media_type,encrypted_media_variants
+from .media_codec import ImageKeys,MediaCodec,media_type,encrypted_media_variants,is_flac_message
 from wx4.reader import reference_text,_xml
 from wx4.game_emojis import describe_game,from_hash
 from .game_emojis import game_image
@@ -26,6 +28,13 @@ from wx4.forward import build_forward
 from .export_options import RESOURCE_TYPES,export_preferences,is_system_message
 
 HASH=re.compile(r'(?i)(?<![a-f0-9])[a-f0-9]{32}(?![a-f0-9])')
+FILE_INDEX = """
+    CREATE TABLE files (name TEXT,stem TEXT,path TEXT,scoped INTEGER,modified REAL);
+    CREATE INDEX by_name ON files(name);
+    CREATE INDEX by_stem ON files(stem);
+"""
+FORWARD_EXTENSIONS = {'.dat','.pic','.jpg','.jpeg','.png','.gif','.webp','.wxgf','.mp4','.mov','.silk','.mp3','.wav'}
+INDEX_EXCLUSIONS = {'.db','.db-wal','.db-shm','.log','.ini'}
 
 def media_url(url):
     try:
@@ -45,21 +54,93 @@ def thumbnail_candidate(path,hints):
     return base in hints.get('thumbnail_hashes',[]) and base not in hints.get('main_hashes',[])
 
 
+class CachedAttachmentUnavailable(OSError):
+    pass
+
+
+def read_cached(read, *args):
+    try:
+        return read(*args)
+    except OSError as error:
+        raise CachedAttachmentUnavailable('本机附件已清理或暂时无法读取。') from error
+
+
+def media_index_rows(bases, cancel, *, forward=False):
+    seen = set()
+    deadline = time.monotonic() + 12
+    remaining = 200000
+    for base, scoped in bases:
+        if not base or not Path(base).is_dir():
+            continue
+        allowed = Path(base).resolve()
+        if allowed in seen:
+            continue
+        seen.add(allowed)
+        for root, dirs, files in os.walk(allowed, followlinks=False):
+            cancel()
+            directory = Path(root)
+            dirs[:] = [d for d in dirs if not (directory/d).is_symlink()]
+            for name in files:
+                path = directory/name
+                suffix = path.suffix.lower()
+                if forward:
+                    if not remaining or time.monotonic() >= deadline:
+                        return
+                    remaining -= 1
+                    if suffix not in FORWARD_EXTENSIONS:
+                        continue
+                elif suffix in INDEX_EXCLUSIONS:
+                    continue
+                if path.is_symlink() or not path.resolve().is_relative_to(allowed):
+                    continue
+                try:
+                    modified = path.stat().st_mtime
+                except OSError:
+                    continue
+                yield name.casefold(), path.stem.casefold(), str(path), scoped, modified
+
+
+class BatchMediaIndex:
+    """Build each account-wide index once, then attach it read-only in each worker."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self.locks = {name: threading.Lock() for name in ('common_media', 'forward_media')}
+        self.ready = set()
+
+    def attach(self, connection, bases, cancel, *, forward=False):
+        name = 'forward_media' if forward else 'common_media'
+        path = self.directory/(name+'.db')
+        with self.locks[name]:
+            cancel()
+            if name not in self.ready:
+                with closing(sqlite3.connect(path)) as index:
+                    index.executescript('DROP TABLE IF EXISTS files;' + FILE_INDEX)
+                    index.executemany('INSERT INTO files VALUES (?,?,?,?,?)', media_index_rows(bases, cancel, forward=forward))
+                    index.commit()
+                self.ready.add(name)
+        connection.execute(f'ATTACH DATABASE ? AS {name}', (path.as_uri()+'?mode=ro',))
+        return name+'.files'
+
+
 class ResourceStore:
-    def __init__(self,data,session,destination,cancel=lambda:None,status=None,options=None,preview=False):
+    def __init__(self,data,session,destination,cancel=lambda:None,status=None,options=None,preview=False, *, remote_media=True, batch_media=None):
         self.data=data;self.session=session;self.out=Path(destination);self.cancel=cancel
         self.preview=preview;self.retry=False;self.sticker_decoder=None
+        self.preview_flac = False
         self.preferences=export_preferences(options or {})
+        self.remote_media = remote_media
         self.skipped=set(self.preferences['skip_resource_types'])
-        self.avatars=AvatarStore(data,Path(data.root).parent/'avatar-cache')
+        self.avatars=AvatarStore.for_archive(data)
+        self.batch_media = batch_media
+        self.file_tables = ['main.files']
+        self.dat_samples = None
         with ExitStack() as handles:
             self.tmp=tempfile.TemporaryDirectory(prefix='wce-resource-')
             handles.callback(self.tmp.cleanup)
-            self.index=sqlite3.connect(str(Path(self.tmp.name)/'index.db'))
+            self.index=sqlite3.connect((Path(self.tmp.name)/'index.db').as_uri(), uri=True)
             handles.callback(self.index.close)
-            self.index.executescript('''
-                CREATE TABLE files (name TEXT,stem TEXT,path TEXT,scoped INTEGER,modified REAL);
-                CREATE INDEX by_name ON files(name); CREATE INDEX by_stem ON files(stem);
+            self.index.executescript(FILE_INDEX + '''
                 CREATE TABLE refs (server TEXT,local TEXT,kind INTEGER,ctime INTEGER,source TEXT);
                 CREATE INDEX ref_server ON refs(server); CREATE INDEX ref_local ON refs(local,kind,ctime);
                 CREATE TABLE messages (server TEXT,shard INTEGER,row_key INTEGER,mode TEXT);
@@ -79,56 +160,44 @@ class ResourceStore:
 
     def _index(self):
         if self.indexed:return
-        self.indexed=True
-        bases=[(self.data.attach_dir(self.session),1)]
+        scoped = [(self.data.attach_dir(self.session), 1)]
+        bases = []
         for name in ('video','file','emoji','emotion','emoticon','record','recorditem'):
-            if not self.preview or name in ('emoji','emotion','emoticon'):
+            if not self.preview or (self.preview_flac and name == 'file') or name in ('emoji','emotion','emoticon'):
                 bases.append((str(Path(self.data.msg_dir())/name),0))
         account=Path(self.data.account_dir())
         if not self.preview or self.retry:
             bases.extend((str(account/p),0) for p in ('cache','emotion','business/emoticon','FileStorage/CustomEmotion'))
-        seen=set()
-        for base,scoped in bases:
-            if not base or not Path(base).is_dir():continue
-            allowed=Path(base).resolve()
-            if allowed in seen:continue
-            seen.add(allowed)
-            for root,dirs,files in os.walk(allowed,followlinks=False):
-                self.cancel();dirs[:]=[d for d in dirs if not (Path(root)/d).is_symlink()]
-                for name in files:
-                    path=Path(root)/name
-                    if path.is_symlink() or not path.resolve().is_relative_to(allowed):continue
-                    if path.suffix.lower() in ('.db','.db-wal','.db-shm','.log','.ini'):continue
-                    try:
-                        modified = path.stat().st_mtime
-                    except OSError:
-                        continue
-                    self.index.execute('INSERT INTO files VALUES (?,?,?,?,?)',
-                        (name.casefold(),path.stem.casefold(),str(path),scoped,modified))
+        if self.batch_media:
+            self.file_tables.append(self.batch_media.attach(self.index, bases, self.cancel))
+            bases = []
+        self.index.executemany('INSERT INTO files VALUES (?,?,?,?,?)', media_index_rows(scoped+bases, self.cancel))
         self.index.commit()
+        self.indexed = True
 
     def _index_forward_media(self):
         if self.forward_indexed:return
-        self.forward_indexed=True;self._index()
-        base=Path(self.data.msg_dir())/'attach'
-        if not base.is_dir():return
-        allowed=base.resolve();deadline=time.monotonic()+12;count=0
+        self._index()
+        bases = [(Path(self.data.msg_dir())/'attach', 0)]
         # A forwarded image may retain the original conversation's file hash.
         # Only index names here; copying still requires an explicit item match.
-        for root,dirs,files in os.walk(allowed,followlinks=False):
-            self.cancel();dirs[:]=[d for d in dirs if not (Path(root)/d).is_symlink()]
-            for name in files:
-                if time.monotonic()>=deadline or count>=200000:
-                    self.index.commit();return
-                count+=1;path=Path(root)/name
-                if path.suffix.lower() not in ('.dat','.pic','.jpg','.jpeg','.png','.gif','.webp','.wxgf','.mp4','.mov','.silk','.mp3','.wav'):continue
-                if path.is_symlink() or not path.resolve().is_relative_to(allowed):continue
-                try:
-                    modified = path.stat().st_mtime
-                except OSError:
-                    continue
-                self.index.execute('INSERT INTO files VALUES (?,?,?,0,?)',(name.casefold(),path.stem.casefold(),str(path),modified))
-        self.index.commit()
+        if self.batch_media:
+            self.file_tables.append(self.batch_media.attach(self.index, bases, self.cancel, forward=True))
+        else:
+            self.index.executemany('INSERT INTO files VALUES (?,?,?,?,?)', media_index_rows(bases, self.cancel, forward=True))
+            self.index.commit()
+        self.dat_samples = None
+        self.forward_indexed = True
+
+    def _files(self):
+        return ' UNION ALL '.join(f'SELECT * FROM {table}' for table in self.file_tables)
+
+    def _dat_paths(self):
+        if self.dat_samples is None:
+            self.dat_samples = [Path(path) for path, in self.index.execute(
+                f"SELECT path FROM ({self._files()}) WHERE name LIKE '%.dat' "
+                "ORDER BY scoped DESC,modified DESC,name LIMIT 40")]
+        yield from self.dat_samples
 
     def _index_refs(self):
         if self.refs_indexed:return
@@ -156,7 +225,13 @@ class ResourceStore:
                 timestamp=column('messagecreatetime','createtime','timestamp')
                 kind=column('messagelocaltype','localtype','messagetype','type')
                 if not server and not(local and chat):continue
-                for row in con.execute('SELECT * FROM '+q(table)):
+                sql = 'SELECT * FROM '+q(table)
+                params = ()
+                if chat:
+                    params = tuple(chat_ids)
+                    # Older shards can store the same chat ID as integer or text.
+                    sql += ' WHERE CAST('+q(chat)+' AS TEXT) IN ('+','.join('?' for _ in params)+')'
+                for row in con.execute(sql, params):
                     self.cancel()
                     if chat and str(row[chat]) not in chat_ids:continue
                     text='\n'.join(reference_text(v) for v in row if isinstance(v,(bytes,str)))
@@ -185,11 +260,15 @@ class ResourceStore:
         return source+'\n'+'\n'.join(s for s, in rows)
 
     def _candidates(self,msg):
-        self._index();source=self._source(msg)
+        source=self._source(msg)
         hints=msg.get('_media') or {};values=list(hints.get('hashes') or [])
         values+=HASH.findall(source);values+=hints.get('paths') or []
         if msg.get('extra',{}).get('filename'):values.append(msg['extra']['filename'])
         values+=re.findall(r'[\w\-.\u4e00-\u9fff ()]+\.(?:mp4|mov|mkv|webm|jpg|jpeg|png|gif|webp|pic|dat|pdf|docx?|xlsx?|pptx?|zip|txt|silk|mp3)',source,re.I)
+        if not values:
+            return []
+        self._index()
+        matches_sql=f'SELECT path,scoped FROM ({self._files()}) WHERE name=? OR stem=? ORDER BY scoped DESC,path'
         found=[];kind=msg.get('kind')
         for value in dict.fromkeys(values):
             name=Path(str(value).replace(chr(92),'/')).name.casefold()
@@ -198,7 +277,7 @@ class ResourceStore:
                 suffixes = ('_h', '_t', '.h', '.t', '_hd', '.hd', '_thumb', '.thumb') if kind in ('image', 'emoji') else ('_h', '_t')
                 tokens.extend(name + suffix for suffix in suffixes)
             for token in tokens:
-                matches=list(self.index.execute('SELECT path,scoped FROM files WHERE name=? OR stem=? ORDER BY scoped DESC,path',(token,token)))
+                matches=list(self.index.execute(matches_sql,(token,token)))
                 if len(matches)>1 and not HASH.fullmatch(name) and not any(s for _,s in matches):continue
                 for path,_ in matches:
                     p=Path(path);ext=p.suffix.lower()
@@ -227,11 +306,17 @@ class ResourceStore:
         if not dest.exists():
             if blob is not None:dest.write_bytes(blob)
             else:
-                with open(source,'rb') as src,open(dest,'wb') as out:
-                    while True:
-                        self.cancel();chunk=src.read(1024*1024)
-                        if not chunk:break
-                        out.write(chunk)
+                temporary = dest.with_name(dest.name + '.' + uuid.uuid4().hex + '.part')
+                try:
+                    with read_cached(open, source, 'rb') as src, temporary.open('wb') as out:
+                        while True:
+                            self.cancel()
+                            chunk = read_cached(src.read, 1024*1024)
+                            if not chunk:break
+                            out.write(chunk)
+                    os.replace(temporary, dest)
+                finally:
+                    temporary.unlink(missing_ok=True)
         self.stats[status]+=1
         name=Path(source).stem+ext if extension else Path(source).name
         return {'kind':category,'path':dest.relative_to(self.out).as_posix(),'name':name,'status':status,'role':role}
@@ -251,7 +336,7 @@ class ResourceStore:
         except OSError:
             if len(self.download_outcomes)<2048:self.download_outcomes[identity]={'status':'cache_unavailable'}
             return None
-        if self.preview:
+        if self.preview or not self.remote_media:
             self.download_outcomes[identity]={'status':'not_cached'}
             return None
         class Redirect(urllib.request.HTTPRedirectHandler):
@@ -264,7 +349,7 @@ class ResourceStore:
         transports=(True,False) if self.prefer_direct else (False,True)
         errors=[]
         for direct in transports:
-            self.cancel();temp=path.with_suffix('.part')
+            self.cancel();temp=path.with_name(path.name + '.' + uuid.uuid4().hex + '.part')
             try:
                 handlers=[Redirect()]
                 if direct:handlers.append(urllib.request.ProxyHandler({}))
@@ -368,6 +453,8 @@ class ResourceStore:
                     extension=Path(filename).suffix
                     if not re.fullmatch(r'\.[a-zA-Z0-9]{1,10}',extension):extension='.bin'
                     resource=self._copy(source,'file',blob,extension)
+                    if extension.lower() == '.flac' and blob.startswith(b'fLaC'):
+                        resource['playback'] = 'audio'
                     resource['name']=filename;resource['size']=len(blob);resources.append(resource);accepted=True;break
             entry['content']='accepted' if accepted else 'not_decoded'
             have_main=any(r['status']=='available' and r.get('role')=='main' for r in resources)
@@ -434,7 +521,7 @@ class ResourceStore:
         self.cancel()
         if depth==0:self.forward_remaining=5000
         msg=dict(msg);msg['extra']=dict(msg.get('extra') or {})
-        msg['avatar']=self.avatars.export(msg.get('sender_wxid',''),self.out) if self.preferences['include_avatars'] else ''
+        msg['avatar']=self.avatars.export(msg.get('sender_wxid',''),self.out,download=self.remote_media) if self.preferences['include_avatars'] else ''
         if self.preferences['include_avatars'] and not msg['avatar'] and msg.get('_forward_item'):msg['avatar']=self._forward_avatar(msg)
         kind=msg.get('kind');resources=[];fallback=None;image_diagnostics={};fallback_diagnostics={}
         category={'image':'image','emoji':'image','video':'video','voice':'audio','file':'file'}.get(kind)
@@ -456,7 +543,8 @@ class ResourceStore:
             from .sticker_cache import StickerCache
             if self.sticker_decoder is None:
                 self.sticker_decoder=StickerCache(self.data,self.codec,self.cancel,self.keys.progress)
-                self.sticker_decoder.scan_timeout=8 if self.preview and self.retry else 0 if self.preview else 20
+                if self.preview:
+                    self.sticker_decoder.scan_timeout=8 if self.retry else 0
             for digest in msg['_media']['hashes'][:12]:
                 if not HASH.fullmatch(digest):continue
                 member={'md5':digest,'metadata':{'aes_key':next(iter(msg['_media']['keys']),'')}}
@@ -484,16 +572,17 @@ class ResourceStore:
                     # A failed conversion is an unsupported original, rather
                     # than an available audio resource that browsers cannot play.
                     resources.append(self._copy(identity,'original',blob,'.silk',status='unsupported'))
+        oversized_preview = False
+        unavailable = False
         if kind in ('image','emoji','video','file') and not skip and not any(r['role']=='main' for r in resources):
             candidates=self._candidates(msg)
-            samples=[Path(p) for p, in self.index.execute("SELECT path FROM files WHERE name LIKE '%.dat' ORDER BY scoped DESC,modified DESC,name LIMIT 40")]
             for source in candidates:
                 self.cancel()
                 try:
                     if kind in ('image','emoji'):
-                        if source.stat().st_size>128*1024*1024:continue
-                        raw=source.read_bytes()
-                        decoded=self.keys.decode(raw,source,samples,(msg.get('_media') or {}).get('keys') or [])
+                        if read_cached(source.stat).st_size>128*1024*1024:continue
+                        raw=read_cached(source.read_bytes)
+                        decoded=self.keys.decode(raw,source,self._dat_paths(),(msg.get('_media') or {}).get('keys') or [])
                         image=self.keys.rendered or (self.codec.image(decoded) if decoded else None)
                         if image:
                             thumb=thumbnail_candidate(source,msg.get('_media') or {})
@@ -514,10 +603,25 @@ class ResourceStore:
                             resources.append(self._copy(converted,'video',extension='.mp4',identity_source=source));break
                         if fallback is None:fallback=(source,'unsupported')
                     else:
-                        resource=self._copy(source,'file');resource['size']=source.stat().st_size
+                        size = read_cached(source.stat).st_size
+                        if self.preview_flac and size > 8 * 1024**2:
+                            oversized_preview = True
+                            continue
+                        flac = False
+                        if is_flac_message(msg) or source.suffix.lower() == '.flac':
+                            with read_cached(source.open, 'rb') as stream:
+                                flac = read_cached(stream.read, 4) == b'fLaC'
+                        if self.preview_flac and not flac:
+                            continue
+                        resource=self._copy(source,'file',extension='.flac' if flac else None)
+                        resource['size']=size
                         resource['name']=msg.get('extra',{}).get('filename') or resource['name']
+                        if flac:
+                            resource['playback'] = 'audio'
                         resources.append(resource);break
-                except (OSError,ValueError):
+                except CachedAttachmentUnavailable:
+                    unavailable = True
+                except ValueError:
                     if fallback is None:fallback=(source,'corrupt')
         if not skip and skip_all and any(h.get('role') in ('thumbnail','source_icon') for h in (msg.get('_media') or {}).get('urls',[])):
             self._skip(msg,'卡片图片')
@@ -526,16 +630,29 @@ class ResourceStore:
         if kind in ('image','emoji','video','voice','file') and not main and not skip:
             status='missing'
             if fallback:
-                source,status=fallback
-                resources.append(self._copy(source,'original',status=status))
-                if kind in ('image','emoji'):image_diagnostics=fallback_diagnostics
-            elif kind=='voice' and resources:status='unsupported'
-            else:self.stats['missing']+=1
+                source, fallback_status = fallback
+                try:
+                    resources.append(self._copy(source,'original',status=fallback_status))
+                except CachedAttachmentUnavailable:
+                    unavailable = True
+                else:
+                    status = fallback_status
+                    if kind in ('image','emoji'):image_diagnostics=fallback_diagnostics
+            elif kind=='voice' and resources:
+                status='unsupported'
+            if status=='missing':
+                self.stats['missing']+=1
             notices={'missing':'本机附件或有效 CDN 资源尚不可用，请在微信下载原文件后重新导出。',
                 'encrypted':'未取得通过完整校验的图片解密材料，已保留加密原文件。请保持微信登录，在微信打开原图后重新导出。',
                 'unsupported':'原文件已保存，但浏览器格式转换未成功。',
                 'corrupt':'文件内容未能通过格式校验，已保留原文件。'}
             msg['resource_status']=status;msg['resource_notice']=notices[status]
+            if status=='missing' and not self.remote_media:
+                msg['resource_notice']='本机未找到可用附件，已保留消息。'
+            if unavailable and status=='missing':
+                msg['resource_notice']='导出时本机附件已清理或暂时无法读取，已保留消息。'
+            if oversized_preview and status=='missing':
+                msg['resource_notice']='这段音频较大，请导出 HTML 后在对话里播放。'
             if kind=='voice' and status=='missing':
                 msg['resource_notice']='当前快照没有这条语音的数据。请在电脑微信完整播放语音，再点击预览右下角“刷新”重新连接并整理；图片恢复不会更新语音数据库。'
             if kind=='voice' and status=='unsupported':

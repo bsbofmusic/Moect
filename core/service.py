@@ -3,24 +3,31 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import tempfile
 import threading
+import time
 import uuid
 import base64
-from types import SimpleNamespace
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+import psutil
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 from .data import Archive, validate_root
 from .demo import DemoArchive
-from .exporting import FORMATS, export_index, export_session, clean, export_folder_name, unused_folder
-from .avatars import AvatarStore, image_type, avatar_host
+from .exporting import FORMATS, export_index, export_session, clean, export_folder_name, safe_name, unused_folder
+from .avatars import AvatarStore, image_type, avatar_host, snapshot_avatar
+from .media_codec import is_flac_message
+from .resources import BatchMediaIndex
 from .version import VERSION,APP_NAME,TUTORIAL_REVISION
 from .paths import app_data_root
 from .export_options import export_preferences,is_system_message
 from .themes import ACCENT_IDS,palette,accent_choices
-from .archive_packaging import public_options, update_options, export_options, package_folder, folder_sizes
+from .archive_packaging import archive_files, public_options, update_options, export_options, package_folder, folder_sizes
 from .diagnostics import ConnectionProblem, environment
 from . import storage
 from wx4.forward import build_forward
@@ -28,10 +35,32 @@ from wx4.forward import build_forward
 SORT_FIELDS=('frequentExport','name','memberCount','id','lastActivity','exportedCount')
 
 
+class SessionSnapshot(NamedTuple):
+    root: str
+    ids: frozenset[str]
+    avatar_sources: tuple
+    avatar_urls: dict[str, str]
+
+
 def session_sort(value):
     if not isinstance(value,dict) or value.get('field') not in SORT_FIELDS or value.get('order') not in ('asc','desc'):
         raise ValueError('会话排序选项无效')
     return {'field':value['field'],'order':value['order']}
+
+
+def export_selection_key(library):
+    """Scope the saved selection to a stable account or local archive."""
+    if not library:
+        return None
+    if library.get('demo'):
+        return 'demo'
+    account = library.get('account_dir')
+    path = account or library.get('root')
+    if not isinstance(path, str) or not path:
+        return None
+    scope = 'account' if account else 'archive'
+    normalized = os.path.normcase(os.path.abspath(path))
+    return hashlib.sha256(f'{scope}\0{normalized}'.encode('utf-8')).hexdigest()
 
 
 def task_category(task):
@@ -81,7 +110,9 @@ class Service:
         self.events = {}
         self.accounts = {}
         self._moments_preview_cache={}
+        self._session_snapshot = None
         self._library_epoch = 0
+        self._storage_epoch = 0
         self._startup_reconnect_done = False
         self._startup_reconnect_result = None
         self._updating=False
@@ -105,6 +136,11 @@ class Service:
         tasks = self.config.get('tasks')
         self.config['tasks'] = [task for task in tasks if isinstance(task, dict)
                                 and all(isinstance(task.get(key), str) for key in ('id', 'kind', 'status'))] if isinstance(tasks, list) else []
+        selections = self.config.get('last_export_selections')
+        self.config['last_export_selections'] = {
+            key: list(dict.fromkeys(session for session in values if isinstance(session, str) and session))
+            for key, values in selections.items() if isinstance(values, list)
+        } if isinstance(selections, dict) else {}
         library = self.config.get('library')
         if not isinstance(library, dict) or not any(isinstance(library.get(key), str) for key in ('root', 'account_dir')):
             self.config['library'] = None
@@ -118,6 +154,7 @@ class Service:
             self.config.pop('storage_dir', None)
         history = self.config.get('storage_history')
         self.config['storage_history'] = [path for path in history if isinstance(path, str) and path] if isinstance(history, list) else []
+        self._storage_history_pending = bool(self.config['storage_history'])
         if not storage.valid_limit(self.config.get('storage_limit_gb')):
             self.config['storage_limit_gb'] = 0
         self._startup_storage_limit = self.config['storage_limit_gb']
@@ -130,15 +167,14 @@ class Service:
         self.library = self.config.get('library')
         if not isinstance(self.config.get('storage_id'), str) or not self.config['storage_id']:
             self.config['storage_id'] = uuid.uuid4().hex
-        self.storage_root = Path(self.config.get('storage_dir') or self.root).resolve()
+        self.storage_root = self.root.resolve()
         self.storage_warning = ''
         try:
-            if not self.storage_root.is_dir():
-                raise ValueError('缓存磁盘暂不可用')
-            storage.managed_root(self, self.storage_root)
+            configured_root = self.config.get('storage_dir')
+            if configured_root:
+                self.storage_root = storage.managed_root(self, Path(configured_root).absolute())
         except (OSError, ValueError):
             self.storage_warning = '设置的缓存目录暂不可用，请连接原磁盘后再使用缓存或迁移。'
-            self.storage_root = self.root.resolve()
         self._demo_previous = None
         try:self.config['session_sort']=session_sort(self.config.get('session_sort'))
         except ValueError:self.config['session_sort']={'field':'lastActivity','order':'desc'}
@@ -155,7 +191,7 @@ class Service:
         self._startup_reconnect_allowed = self.config['tutorials_seen']['app']==TUTORIAL_REVISION
         from .online import OnlineChannel
         self.online=OnlineChannel(self)
-        if self._startup_storage_limit:
+        if self._startup_storage_limit or self._storage_history_pending:
             self._schedule_storage_check(10)
 
     def appearance(self):return palette(self.config['theme'],self.config['accent'])
@@ -173,13 +209,19 @@ class Service:
             tracked = {t['id'] for t in self.config['tasks']}
             self.events = {key: event for key, event in self.events.items() if key in tracked}
 
-    def archive(self, library=None):
-        lib = library or self.library
+    def archive(self, library=None, *, identity_from=None):
+        with self.lock:
+            lib = library or self.library
+            snapshot = self._session_snapshot
+            cache_root = self.storage_root
         if not lib:
             raise ValueError('请先连接微信、打开备份，或进入演示模式。')
         if not lib.get('demo') and not lib.get('root'):
             raise ValueError('聊天快照不可用，请重新连接微信。')
-        return DemoArchive(lib) if lib.get('demo') else Archive(lib)
+        if lib.get('demo'):
+            return DemoArchive()
+        ids = snapshot.ids if snapshot and snapshot.root == lib['root'] else None
+        return Archive(lib, cache_root=cache_root, identity_from=identity_from, session_ids=ids)
 
     @contextmanager
     def cache_access(self):
@@ -207,19 +249,29 @@ class Service:
     def avatar(self,url):
         with self.cache_access():
             if not isinstance(url,str) or len(url)>4096:return {'url':''}
+            with self.lock:
+                library = self.library or {}
+                snapshot = self._session_snapshot
+            root = library.get('root')
+            cache = AvatarStore(None, self.storage_root/'avatar-cache',
+                                Path(root).parent/'avatar-cache' if root and not library.get('demo') else None)
             if url.startswith('moect-avatar:'):
                 from urllib.parse import unquote
-                with self.lock:library=dict(self.library or {})
-                if not library or library.get('demo'):return {'url':''}
-                identity=hashlib.sha256(str(Path(library['root']).resolve()).encode()).hexdigest()[:16]
+                if not root or library.get('demo'):return {'url':''}
+                identity=hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
                 prefix='moect-avatar:'+identity+':'
                 if not url.startswith(prefix):return {'url':''}
-                with self.read_archive(library) as archive:
-                    blob=archive.avatars.blob(unquote(url[len(prefix):]),download=True)
-                    return {'url':'data:'+image_type(blob)[1]+';base64,'+base64.b64encode(blob).decode() if blob else ''}
-            if not avatar_host(url):return {'url':''}
-            data=SimpleNamespace(_conns={},avatar_of=lambda user:url)
-            blob=AvatarStore(data,self.storage_root/'avatar-cache').blob('',download=True)
+                username = unquote(url[len(prefix):])
+                if snapshot and snapshot.root == root and username in snapshot.avatar_urls:
+                    blob = snapshot_avatar(snapshot.avatar_sources, username)
+                    if not blob:
+                        blob = cache.url_blob(snapshot.avatar_urls[username], download=True)
+                else:
+                    with self.read_archive(library) as archive:
+                        blob = archive.avatars.blob(username, download=True)
+            else:
+                if not avatar_host(url):return {'url':''}
+                blob = cache.url_blob(url, download=True)
             return {'url':'data:'+image_type(blob)[1]+';base64,'+base64.b64encode(blob).decode() if blob else ''}
 
     def state(self):
@@ -228,6 +280,7 @@ class Service:
             return {'version':VERSION, 'theme':self.config['theme'],
                     'online':self.online.status(),
                     'session_sort':dict(self.config['session_sort']),
+                    'last_export_available':bool(self.config['last_export_selections'].get(export_selection_key(lib))),
                     'accent':self.config['accent'],'accents':accent_choices(),'appearance':self.appearance(),
                     'export_dir':self.config['export_dir'],
                     'archive_options':public_options(self.config.get('archive_options')),
@@ -242,9 +295,15 @@ class Service:
                                    imported_at=lib.get('imported_at','')) if lib else None,
                     'tasks': [self.public_task(t) for t in reversed(self.config['tasks'])]}
 
+    def last_export_sessions(self):
+        with self.lock:
+            return list(self.config['last_export_selections'].get(export_selection_key(self.library), ()))
+
     @staticmethod
     def public_task(t):
-        result={k:v for k,v in t.items() if k not in ('folder','files')}
+        result={k:v for k,v in t.items() if k not in ('folder','files','session_progress')}
+        if t.get('session_progress'):
+            result['has_session_progress'] = True
         result['category']=task_category(t)
         files=t.get('files') or []
         if files:
@@ -253,6 +312,30 @@ class Service:
             result.setdefault('start_time',files[0].get('start_time'))
             result.setdefault('end_time',files[-1].get('end_time'))
         return result
+
+    def task_session_progress(self, payload):
+        job_id = payload.get('id')
+        offset = payload.get('offset', 0)
+        if not isinstance(job_id, str) or type(offset) is not int or offset < 0:
+            raise ValueError('批量任务分页参数无效')
+        limit = 40
+        with self.lock:
+            task = next((t for t in self.config['tasks'] if t['id'] == job_id), {})
+            saved = task.get('session_progress')
+            rows = saved if isinstance(saved, list) else []
+            result = []
+            parent_status = task.get('status')
+            for row in rows[offset:offset+limit]:
+                if not isinstance(row, dict):
+                    continue
+                item = dict(row)
+                if parent_status in ('failed', 'cancelled', 'interrupted'):
+                    if item.get('status') == 'completed':
+                        item['status'] = 'discarded'
+                    elif item.get('status') in ('queued', 'running'):
+                        item['status'] = 'interrupted' if parent_status == 'failed' else parent_status
+                result.append(item)
+        return {'rows':result, 'total':len(rows), 'limit':limit}
 
     def hydrate_profile(self,archive,lib):
         if isinstance(archive,Archive):
@@ -300,6 +383,43 @@ class Service:
                 self.save()
                 raise ValueError('软件正在退出或任务队列暂不可用，请重新打开后重试。') from error
 
+    def _run_export_batch(self, count, export_one, check, on_wait):
+        """Yield completed sessions while keeping a bounded worker queue."""
+        cores = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+        limit = 1 if cores <= 1 else min(4, max(2, cores // 2))
+        active = set()
+        next_session = 0
+        cpu = psutil.cpu_percent(interval=0.15)
+        measured = time.monotonic()
+        with ThreadPoolExecutor(max_workers=limit, thread_name_prefix='session-export') as exports:
+            while next_session < count or active:
+                check()
+                if active:
+                    should_wait = len(active) >= limit or next_session >= count
+                    done, active = wait(active, timeout=0.4 if should_wait else 0, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        yield future.result()
+                if len(active) >= limit or next_session >= count:
+                    continue
+                now = time.monotonic()
+                if now - measured >= 0.4:
+                    cpu = psutil.cpu_percent()
+                    measured = now
+                memory = psutil.virtual_memory()
+                reserve = min(768 * 1024**2, memory.total // 8)
+                need = reserve + len(active) * 512 * 1024**2
+                if memory.available < need or (active and cpu >= 85):
+                    on_wait()
+                    if active:
+                        done, active = wait(active, timeout=0.4, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            yield future.result()
+                    else:
+                        time.sleep(0.4)
+                    continue
+                active.add(exports.submit(export_one, next_session))
+                next_session += 1
+
     def _update(self, job, **values):
         with self.lock:
             job.update(values)
@@ -310,6 +430,7 @@ class Service:
             raise Cancelled()
 
     def _run(self, job, fn):
+        storage_epoch = self._storage_epoch
         try:
             with self.lock:
                 self._check(job)
@@ -317,7 +438,14 @@ class Service:
             fn()
             self._update(job, status='completed', progress=100)
         except Cancelled:
-            self._update(job, status='cancelled', detail='任务已取消，未完成的导出已清理。')
+            if job['kind'] == 'storage_migrate' and storage_epoch != self._storage_epoch:
+                self._update(job, status='completed', progress=100, detail='已切换到新位置，旧缓存清理已停止。')
+            else:
+                detail = {
+                    'storage_migrate':'已取消缓存迁移，继续使用原位置。',
+                    'storage_cleanup':'已停止缓存清理。',
+                }.get(job['kind'], '任务已取消，未完成的导出已清理。')
+                self._update(job, status='cancelled', detail=detail)
         except Exception as exc:
             # Do not return tracebacks, key values or chat content to the UI.
             message = str(exc)
@@ -359,6 +487,7 @@ class Service:
         """Called under lock: a stale worker must never restore a signed-out account."""
         self._library_epoch += 1
         self._moments_preview_cache.clear()
+        self._session_snapshot = None
         self._startup_reconnect_result = None
         for task in self.config['tasks']:
             if task['kind'] in ('connect','refresh_assets','recover_images') and task['status'] in ('queued','running'):
@@ -408,7 +537,7 @@ class Service:
         with self.cache_access():
             root = validate_root(path)
             lib = dict(name=Path(root).name or '本地归档', root=root, wxid='', imported_at=datetime.now().strftime('%Y-%m-%d %H:%M'))
-            archive = Archive(lib)
+            archive = self.archive(lib)
             try:
                 if not archive.sessions():
                     raise ValueError('没有找到可浏览的会话。请检查备份是否完整。')
@@ -532,6 +661,7 @@ class Service:
                     check_connection()
                     self._library_epoch += 1
                     self._moments_preview_cache.clear()
+                    self._session_snapshot = None
                     self._demo_previous = None
                     self.library = lib; self.config['library'] = lib
                 self._update(job, diagnostic={**job.get('diagnostic',{}),'media_databases_missing':missing_media},
@@ -547,12 +677,21 @@ class Service:
         with self.lock:lib=self.library
         with self.read_archive(lib) as archive:
             self.hydrate_profile(archive,lib)
-            return archive.sessions()
+            rows = archive.sessions()
+            if isinstance(archive, Archive):
+                sources = archive.avatars.snapshot_sources()
+                urls = {row['username']: archive.data.avatar_of(row['username']) for row in rows
+                        if row['avatar_url'].startswith('moect-avatar:')}
+                ids = frozenset(row['username'] for row in rows)
+                with self.lock:
+                    if self.library is lib:
+                        self._session_snapshot = SessionSnapshot(lib['root'], ids, sources, urls)
+            return rows
 
     def messages(self, payload):
         with self.read_archive() as archive:
             session = payload.get('session', '')
-            if session not in {s['username'] for s in archive.sessions()}:
+            if not archive.has_session(session):
                 raise ValueError('会话不存在')
             before=payload.get('before')
             if before is not None and (not isinstance(before,list) or len(before)!=3 or not all(isinstance(x,(int,float)) for x in before)):
@@ -568,23 +707,28 @@ class Service:
         if flt.get('startTime'):options['start']=int(flt['startTime'])//1000
         if flt.get('endTime'):options['end']=int(flt['endTime'])//1000
         with self.read_archive() as archive:
-            if session not in {s['username'] for s in archive.sessions()}:raise ValueError('会话不存在')
+            if not archive.has_session(session):raise ValueError('会话不存在')
             if isinstance(archive,DemoArchive):
                 rows=list(archive.messages(session,options,descending=True));total=len(rows)
                 rows=rows[(page-1)*limit:page*limit]
             else:rows,total=archive.numbered_page(session,options,page,limit)
             result=[]
+            avatars={}
+            real = isinstance(archive, Archive)
             for m in rows:
                 rich=dict(m.get('extra',{}))
-                if isinstance(archive, Archive) and m.get('kind') in ('image', 'emoji', 'voice'):
+                if real and (m.get('kind') in ('image', 'emoji', 'voice') or is_flac_message(m)):
                     rich['media'] = {'session': session, 'shard': m['shard'], 'local_id': m['local_id'],
                                      'server_id': str(m['server_id']), 'kind': m['kind']}
-                if m.get('kind')=='chatrecord' and isinstance(archive,Archive):
+                if m.get('kind')=='chatrecord' and real:
                     rich['forward']=clean(build_forward(archive.data,m,limit=1500))
+                sender=m['sender_wxid']
+                if real and sender not in avatars:
+                    avatars[sender]=archive.avatars.ui(sender)
                 result.append(dict(msgId='%s_%s_%s'%(m['shard'],m['local_id'],m['server_id']),
                                    msgSeq=m['local_id'],msgTime=m['create_time'],
-                                   senderUid=m['sender_wxid'],senderUin='',
-                                   senderAvatar=archive.avatars.ui(m['sender_wxid']) if isinstance(archive,Archive) else '',
+                                   senderUid=sender,senderUin='',
+                                   senderAvatar=avatars.get(sender,''),
                                    isSystem=is_system_message(m),
                                    richContent=rich,
                                    elements=[{'textElement':{'content':m['text']}}],
@@ -611,40 +755,50 @@ class Service:
             check()
             return result
 
-    def _finish_export_files(self, job, result, staging, output, folder_name, packaging, password, source_bytes):
-        sizes = folder_sizes(staging)
+    def _finish_export_files(self, job, result, staging, output, folder_name, packaging, password, source_bytes,
+                             *, batch=False):
+        self._check(job)
+        check = lambda: self._check(job)
+        files = list(archive_files(staging, check)) if packaging.get('zip') else None
+        sizes = folder_sizes(staging, check, files=files)
         sizes.update(source_db_bytes=source_bytes, source_scope='account_databases')
         packed = output/('.partial_' + job['id'] + '.zip')
         try:
             if packaging.get('zip'):
-                package_folder(staging, packed, password, lambda: self._check(job), lambda message: self._update(job, detail=message))
-                target = output/(folder_name + '.zip')
-                number = 2
-                while target.exists():
-                    target = output/(folder_name + '_' + str(number) + '.zip')
-                    number += 1
-                try:
-                    os.rename(packed, target)
-                except FileExistsError:
-                    # Another process may have taken the name since the check.
-                    target = output/(folder_name + '_' + job['id'] + '.zip')
-                    os.rename(packed, target)
+                start = job['progress']
+                package_folder(staging, packed, password, check,
+                               lambda message: self._update(job, detail=message),
+                               progress=lambda fraction: self._update(job, progress=int(start+(99-start)*fraction)),
+                               root_name=folder_name if batch else None, files=files)
+                with self.lock:
+                    self._check(job)
+                    target = unused_folder(output, folder_name, '.zip')
+                    try:
+                        os.rename(packed, target)
+                    except FileExistsError:
+                        target = output/(folder_name + '_' + job['id'] + '.zip')
+                        os.rename(packed, target)
                 result['path'] = str(target)
                 folder = output
                 sizes['archive_bytes'] = target.stat().st_size
             else:
-                folder = unused_folder(output, folder_name)
-                os.replace(staging, folder)
+                with self.lock:
+                    self._check(job)
+                    folder = unused_folder(output, folder_name)
+                    os.rename(staging, folder)
                 result['path'] = str(folder/Path(result['path']).relative_to(staging))
             return folder, sizes
         finally:
             packed.unlink(missing_ok=True)
 
     def export(self, payload):
-        if not self.library: raise ValueError('请先连接数据')
+        with self.lock:
+            library = dict(self.library or {})
+            storage_epoch = self._storage_epoch
+        if not library: raise ValueError('请先连接数据')
         fmt=payload.get('format','html')
         if fmt not in FORMATS: raise ValueError('不支持此格式')
-        library=dict(self.library)
+        selection_key = export_selection_key(library)
         with self.read_archive(library) as archive:
             requested = payload.get('sessions') or []
             if not isinstance(requested, list) or any(not isinstance(value, str) for value in requested):
@@ -655,55 +809,199 @@ class Service:
         options=options_from(payload); options.update(format=fmt,demo=library.get('demo',False),_theme=self.export_theme())
         packaging, password = export_options(self.config.get('archive_options'), payload)
         source_bytes = storage.source_database_bytes(library)
-        output=Path(self.config['export_dir']).resolve()
-        prepared = []
+        count = len(sessions)
+        batch = count > 1
+        title = f'批量导出 · {count:,} 个会话' if batch else sessions[0]['display']
+        if batch:
+            folder_name = '批量导出_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        else:
+            folder_name = export_folder_name(title, sessions[0]['username'])
+        if options['demo']:
+            folder_name += '_演示'
         with self.lock:
-            previous_tasks = list(self.config['tasks'])
-            previous_events = dict(self.events)
+            if storage_epoch != self._storage_epoch:
+                raise ValueError('缓存位置已更改，请重新提交导出。')
+            output=Path(self.config['export_dir']).resolve()
             previous_packaging = self.config.get('archive_options')
+            job = self._new_job('export', title, persist=False)
+            job.update(format=fmt, start_time=options.get('start'), end_time=options.get('end'),
+                       demo=options['demo'], session_total=count)
+            children = [{'name':session['display'], 'status':'queued', 'scanned':0, 'count':0, 'total':None}
+                        for session in sessions] if batch else []
+            if batch:
+                job['session_progress'] = children
+            else:
+                job['session'] = sessions[0]['username']
             try:
                 self.config['archive_options'] = packaging
-                for session in sessions:
-                    job = self._new_job('export', session['display'], persist=False)
-                    job.update(format=fmt, session=session['username'], start_time=options.get('start'),
-                               end_time=options.get('end'), demo=library.get('demo', False))
-
-                    def work(session=session, job=job):
-                        staging = output/('.partial_' + job['id'])
-                        staging.mkdir(parents=True, exist_ok=False)
-                        archive = None
-                        try:
-                            archive = self.archive(library)
-                            self._check(job)
-                            def progress(count):
-                                self._check(job)
-                                self._update(job, count=count, detail='正在导出 %s · %s 条' % (session['display'], count))
-                            result = export_session(archive, session, options, staging, self.assets, progress,
-                                                    lambda: self._check(job), status=lambda message: self._update(job, detail=message))
-                            export_index(staging, [result], demo=job['demo'], theme=options['_theme'])
-                            self._check(job)
-                            folder_name = export_folder_name(session['display'], session['username']) + ('_演示' if job['demo'] else '')
-                            folder, sizes = self._finish_export_files(job, result, staging, output, folder_name, packaging, password, source_bytes)
-                            self._update(job, folder=str(folder), files=[result], count=result['count'],
-                                         start_time=result.get('start_time'), end_time=result.get('end_time'),
-                                         resource_summary=result.get('resource_summary', {}),
-                                         size_info=sizes, compressed=bool(packaging.get('zip')), encrypted=bool(packaging.get('encrypt')),
-                                         detail='已保存 1 个会话，共 %s 条消息' % f"{result['count']:,}")
-                        finally:
-                            if archive is not None:
-                                archive.close()
-                            if staging.exists():
-                                shutil.rmtree(staging, ignore_errors=True)
-                    prepared.append((job, work))
                 self.save()
             except BaseException:
-                self.config['tasks'] = previous_tasks
-                self.events = previous_events
+                self.config['tasks'].remove(job)
+                self.events.pop(job['id'], None)
                 self.config['archive_options'] = previous_packaging
                 raise
-            self._submit_jobs(prepared)
-        jobs = [job['id'] for job, _ in prepared]
-        return {'job': jobs[0], 'jobs': jobs}
+
+        def check():
+            self._check(job)
+
+        def work():
+            staging = output/('.partial_' + job['id'])
+            staging.mkdir(parents=True, exist_ok=False)
+            active = {}
+            finished = {}
+            failures = {}
+            finished_messages = 0
+            finished_units = 0
+            # Opening and finalizing even an empty export has a small fixed cost.
+            session_overhead = 20
+            totals = {}
+            total_units = 0
+            batch_media = None
+            batch_identities = None
+
+            def show_progress(detail):
+                with self.lock:
+                    done = len(finished) + len(failures)
+                    scanned_units = finished_units + sum(value[0] for value in active.values())
+                    percent = 6 + 82 * scanned_units // total_units
+                    written = finished_messages + sum(value[1] for value in active.values())
+                    prefix = f'会话 {done:,} / {count:,} · ' if batch else ''
+                    self._update(job, progress=max(job['progress'], percent), count=written, detail=prefix + detail)
+
+            def export_one(index):
+                nonlocal total_units
+                check()
+                session = sessions[index]
+                name = session['display']
+                child = staging/f'{index+1:04d} {safe_name(name)[:36].rstrip(" .")}' if batch else staging
+                child.mkdir(exist_ok=not batch)
+
+                def update(scanned, written, detail):
+                    with self.lock:
+                        scanned = min(scanned, totals[index])
+                        active[index] = (scanned, written)
+                        if batch:
+                            children[index].update(scanned=scanned, count=written)
+                            children[index].pop('detail', None)
+                        show_progress((name + ' · ' if batch else '') + detail)
+
+                def resource_status(detail):
+                    with self.lock:
+                        if batch:
+                            children[index]['detail'] = detail
+                        show_progress((name + ' · ' if batch else '') + detail)
+
+                try:
+                    if batch:
+                        self._update(children[index], status='running')
+                    with closing(self.archive(library, identity_from=batch_identities)) as archive:
+                        check()
+                        if not batch:
+                            self._update(job, progress=2, detail='正在统计待扫描的消息…')
+                            totals[index] = archive.message_count(session['username'], options, check)
+                            total_units = totals[index] + session_overhead
+                        total = totals[index]
+                        update(0, 0, '正在导出消息和附件…')
+                        last_update = 0.0
+
+                        def scan_progress(scanned, written):
+                            nonlocal last_update
+                            now = time.monotonic()
+                            if now - last_update >= 0.2:
+                                last_update = now
+                                update(scanned, written, f'已处理 {scanned:,} / {total:,} 条，已导出 {written:,} 条')
+
+                        record = export_session(archive, session, options, child, self.assets, lambda _: check(), check,
+                                                status=resource_status, scan_progress=scan_progress, batch=batch,
+                                                batch_media=batch_media)
+                    return index, record
+                except (ValueError, sqlite3.Error):
+                    if not batch:
+                        raise
+                    if child.resolve().parent == staging:
+                        shutil.rmtree(child)
+                    return index, None
+
+            try:
+                with ExitStack() as handles:
+                    if batch:
+                        self._update(job, progress=2, detail='正在统计待扫描的消息…')
+                        with self.read_archive(library) as archive:
+                            for index, session in enumerate(sessions):
+                                check()
+                                try:
+                                    totals[index] = archive.message_count(session['username'], options, check)
+                                except (ValueError, sqlite3.Error):
+                                    failures[index] = session['display']
+                                    self._update(children[index], status='failed')
+                                else:
+                                    self._update(children[index], total=totals[index])
+                            share_media = hasattr(archive, 'data')
+                            if isinstance(archive, Archive):
+                                batch_identities = archive.data
+                        total_units = sum(totals.values()) + session_overhead * count
+                        finished_units = session_overhead * len(failures)
+                        if share_media and totals:
+                            temporary = handles.enter_context(tempfile.TemporaryDirectory(prefix='moect-batch-media-'))
+                            batch_media = BatchMediaIndex(temporary)
+                        # Start large conversations early but keep the user's folder order.
+                        order = sorted(totals, key=totals.__getitem__, reverse=True)
+                        reports = handles.enter_context(closing(self._run_export_batch(
+                            len(order), lambda position: export_one(order[position]), check,
+                            lambda: show_progress('系统负载较高，等待可用资源…')))) if order else ()
+                    else:
+                        reports = (export_one(0),)
+                    for index, record in reports:
+                        with self.lock:
+                            active.pop(index, None)
+                            finished_units += totals[index] + session_overhead
+                            if record is None:
+                                failures[index] = sessions[index]['display']
+                                if batch:
+                                    children[index]['status'] = 'failed'
+                            else:
+                                finished[index] = record
+                                finished_messages += record['count']
+                                if batch:
+                                    children[index].update(status='completed', scanned=totals[index], count=record['count'])
+                            show_progress('正在整理会话…')
+                check()
+                if not finished:
+                    raise ValueError('所选会话均未能导出，请重新连接并检查聊天快照。')
+                records = [finished[index] for index in sorted(finished)]
+                export_index(staging, records, demo=job['demo'], theme=options['_theme'], directory=batch,
+                             failures=[failures[index] for index in sorted(failures)])
+                summary = records[0]
+                if batch:
+                    stats = Counter()
+                    for record in records:
+                        stats.update(record.get('resource_summary', {}))
+                    starts = [record['start_time'] for record in records if record.get('start_time') is not None]
+                    ends = [record['end_time'] for record in records if record.get('end_time') is not None]
+                    summary = dict(name=title, path=str(staging/'index.html'), format=fmt, count=finished_messages,
+                                   start_time=min(starts, default=None), end_time=max(ends, default=None),
+                                   resource_summary=dict(stats))
+                self._update(job, progress=90, detail='正在整理导出文件…')
+                folder, sizes = self._finish_export_files(job, summary, staging, output, folder_name, packaging,
+                                                          password, source_bytes, batch=batch)
+                detail = f'已保存 {len(records):,} 个会话，共 {finished_messages:,} 条消息'
+                if failures:
+                    detail += f'，{len(failures):,} 个会话未导出，详见会话目录'
+                with self.lock:
+                    if selection_key:
+                        self.config['last_export_selections'][selection_key] = list(dict.fromkeys(
+                            sessions[index]['username'] for index in sorted(finished)))
+                    self._update(job, folder=str(folder), files=[summary], count=finished_messages,
+                                 session_failed=len(failures), session_exported=len(records),
+                                 start_time=summary.get('start_time'), end_time=summary.get('end_time'),
+                                 resource_summary=summary.get('resource_summary', {}), size_info=sizes,
+                                 compressed=bool(packaging.get('zip')), encrypted=bool(packaging.get('encrypt')), detail=detail)
+            finally:
+                if staging.exists() and staging.resolve().parent == output:
+                    shutil.rmtree(staging, ignore_errors=True)
+
+        self._submit_jobs([(job, work)])
+        return {'job': job['id']}
 
     def cancel(self, job_id):
         if job_id in self.events: self.events[job_id].set()
@@ -712,7 +1010,9 @@ class Service:
     def account_assets(self,payload):
         with self.cache_access():
             from .account_assets import StickerCatalog,MomentsCatalog,moment_selection
-            with self.lock:library=dict(self.library or {})
+            with self.lock:
+                active_library=self.library
+                library=dict(active_library or {})
             if not library or library.get('demo'):
                 return {'available':False,'notice':'请先连接微信账号；演示模式不包含真实的表情包和朋友圈。'}
             kind=payload.get('kind')
@@ -725,19 +1025,25 @@ class Service:
             if kind!='moments':raise ValueError('不支持的资源类型')
             archive=self.archive(library)
             try:
-                profile=archive.profile();selection=moment_selection(payload,profile['wxid'],archive.data.contacts,allow_empty=True)
+                owner=archive.data.wxid
+                selection=moment_selection(payload,owner,archive.data.contacts,allow_empty=True)
                 dates=options_from({k:payload[k] for k in ('start','end') if k in payload})
-                result=MomentsCatalog(library,profile['wxid'],selection['scope'],selection['author_id']).summary(dates.get('start'),dates.get('end'),archive.data.name_of)
-                result['selection']=selection
+                start,end=dates.get('start'),dates.get('end')
                 from .account_exporting import local_moments_previews
-                preview_key=(library['root'],library.get('assets_revision'),library.get('media_revision'),selection['scope'],selection['author_id'],dates.get('start'),dates.get('end'))
-                with self.lock:posts=self._moments_preview_cache.get(preview_key)
-                if posts is None:
-                    posts=local_moments_previews(archive,library,selection,dates.get('start'),dates.get('end'))
+                preview_key=(library['root'],library.get('assets_root'),library.get('assets_revision'),
+                             library.get('media_revision'),owner,selection['scope'],selection['author_id'],start,end)
+                if library.get('account_dir'):
+                    with self.lock:cached=self._moments_preview_cache.get(preview_key)
+                    if cached is not None:return cached
+                catalog=MomentsCatalog(library,owner,selection['scope'],selection['author_id'])
+                result=catalog.summary(start,end,archive.data.name_of,
+                    render_previews=lambda posts:local_moments_previews(archive,library,posts))
+                result['selection']=selection
+                if library.get('account_dir'):
                     with self.lock:
-                        if len(self._moments_preview_cache)>=8:self._moments_preview_cache.clear()
-                        self._moments_preview_cache[preview_key]=posts
-                result['posts']=posts
+                        if self.library is active_library:
+                            if len(self._moments_preview_cache)>=8:self._moments_preview_cache.clear()
+                            self._moments_preview_cache[preview_key]=result
                 return result
             finally:archive.close()
 
@@ -775,8 +1081,8 @@ class Service:
     def favorite_preview(self,payload):
         from .favorites import FavoriteCatalog,FavoriteResources
         from .resources import ResourceStore
-        import tempfile
-        import time
+        from PIL import Image
+        import io
         identity=payload.get('id')
         if not isinstance(identity,str) or not identity.isdigit():raise ValueError('收藏选择无效')
         with self.lock:library=dict(self.library or {});epoch=self._library_epoch
@@ -785,7 +1091,8 @@ class Service:
             with self.lock:
                 if epoch!=self._library_epoch or self._closed:raise Cancelled()
         with self.read_archive(library) as archive:
-            item=next(FavoriteCatalog(library,archive.data.name_of).items({'ids':[identity]},check),None)
+            with closing(FavoriteCatalog(library,archive.data.name_of).items({'ids':[identity]},check)) as matches:
+                item=next(matches,None)
             if item is None:raise ValueError('这条收藏已变化，请刷新列表。')
             class PreviewBudget(Exception):pass
             deadline=time.monotonic()+5
@@ -802,8 +1109,6 @@ class Service:
                         remaining-=1;resolver.resolve(block)
                         for resource in block['resources']:
                             if resource['kind']!='image':continue
-                            from PIL import Image
-                            import io
                             with Image.open(Path(tmp)/resource['path']) as image:
                                 image.thumbnail((640,640));output=io.BytesIO();image.convert('RGB').save(output,format='JPEG',quality=82)
                             resource['url']='data:image/jpeg;base64,'+base64.b64encode(output.getvalue()).decode()
@@ -880,7 +1185,7 @@ class Service:
                     finally:archive.close()
                 with self.lock:
                     check();self.library={**self.library,'assets_root':str(destination),'assets_revision':job['id']}
-                    self.library.pop('moments_prepared',None)
+                    self._moments_preview_cache.clear()
                     self.config['library']=self.library
                 detail='资源快照已更新。'
                 if prepare_stickers:detail='所选表情资源已尝试缓存；失效链接和未开放下载地址的条目仍可能缺失。'
@@ -898,7 +1203,9 @@ class Service:
         from .account_assets import moment_selection
         kind=payload.get('kind')
         if kind not in ('stickers','moments','favorites'):raise ValueError('不支持的资源类型')
-        with self.lock:library=dict(self.library or {})
+        with self.lock:
+            library=dict(self.library or {})
+            storage_epoch = self._storage_epoch
         if not library or library.get('demo'):raise ValueError('请先连接真实微信账号。')
         options={key:value for key,value in payload.items() if not key.startswith('archive')};options['_theme']=self.export_theme()
         packaging,password=export_options(self.config.get('archive_options'),payload)
@@ -910,8 +1217,10 @@ class Service:
             selection=moment_selection(payload,profile['wxid'],archive.data.contacts) if kind=='moments' else None
             if selection:options.update(scope=selection['scope'],authorId=selection['author_id'])
         label='表情包' if kind=='stickers' else '收藏' if kind=='favorites' else selection['label'];title=profile['name']+' · '+label
-        output=Path(self.config['export_dir']).resolve()
         with self.lock:
+            if storage_epoch != self._storage_epoch:
+                raise ValueError('缓存位置已更改，请重新提交导出。')
+            output=Path(self.config['export_dir']).resolve()
             previous=self.config.get('archive_options')
             self.config['archive_options']=packaging
             try:job=self._new_job('export',title)
@@ -1031,7 +1340,7 @@ class Service:
 
     def _schedule_storage_check(self, delay):
         with self.lock:
-            if self._closed:
+            if self._closed or self._storage_timer is not None:
                 return
             self._storage_timer = threading.Timer(delay, self._queue_storage_check)
             self._storage_timer.daemon = True
@@ -1040,7 +1349,8 @@ class Service:
     def _queue_storage_check(self):
         with self.lock:
             self._storage_timer = None
-            if self._closed or self._updating or self.storage_warning or not self.config['storage_limit_gb']:
+            if (self._closed or self._updating or self.storage_warning
+                    or not (self._storage_history_pending or self._startup_limit_is_current())):
                 return
             if self._maintenance or self._cache_readers or any(t['status'] in ('running','queued') for t in self.config['tasks']):
                 self._schedule_storage_check(5)
@@ -1051,6 +1361,9 @@ class Service:
             except RuntimeError:
                 self._maintenance = False
 
+    def _startup_limit_is_current(self):
+        return self._startup_storage_limit and self._startup_storage_limit == self.config['storage_limit_gb']
+
     def _check_storage_limit(self):
         job = None
         def check():
@@ -1058,12 +1371,19 @@ class Service:
                 raise Cancelled()
         try:
             check()
+            if self._storage_history_pending:
+                self._storage_history_pending = False
+                try:
+                    storage.reconcile_storage_history(self, check)
+                except (OSError, ValueError):
+                    pass
+            if not self._startup_limit_is_current():
+                return
             total = storage.storage_info(self, check)['bytes']
             limit = self._startup_storage_limit * 1024**3
             with self.lock:
                 check()
-                # Turning the cap off also cancels an outstanding startup check.
-                if not self.config['storage_limit_gb'] or total <= limit:
+                if not self._startup_limit_is_current() or total <= limit:
                     return
                 job = self._new_job('storage_cleanup', '自动清理过期快照与缓存')
             self._run(job, lambda: storage.cleanup(self, job, limit_bytes=limit, total_bytes=total))
@@ -1072,6 +1392,42 @@ class Service:
         finally:
             if job is None:
                 with self.lock:self._maintenance = False
+
+    def get_storage_info(self):
+        with self.lock:
+            if (self.storage_warning and self.config.get('storage_dir') and not self._maintenance
+                    and not self._cache_readers and not any(t['status'] in ('running','queued') for t in self.config['tasks'])):
+                try:
+                    root = storage.managed_root(self, Path(self.config['storage_dir']).absolute())
+                except (OSError, ValueError):
+                    pass
+                else:
+                    self.storage_root, self.storage_warning = root, ''
+                    self._storage_epoch += 1
+                    self._invalidate_connections()
+                    if self._storage_history_pending or self._startup_limit_is_current():
+                        self._schedule_storage_check(10)
+        with self.cache_access():
+            return storage.storage_info(self)
+
+    def set_export_directory(self, directory):
+        path = Path(directory).resolve()
+        with self.lock:
+            if self._maintenance:
+                raise ValueError('请等待缓存管理任务完成后，再设置导出位置。')
+            configured = self.config.get('storage_dir') or self.root
+            roots = [self.storage_root, self.root.resolve(), Path(configured).absolute(),
+                     *(Path(value) for value in self.config['storage_history'] if Path(value).is_absolute())]
+            if any(path.is_relative_to(root/name) for root in roots for name in storage.MANAGED):
+                raise ValueError('请选择缓存目录之外的文件夹来保存导出文件。')
+            previous = self.config['export_dir']
+            self.config['export_dir'] = str(path)
+            try:
+                self.save()
+            except BaseException:
+                self.config['export_dir'] = previous
+                raise
+        return self.state()
 
     def storage_job(self, kind, directory=None):
         with self.lock:
@@ -1095,7 +1451,11 @@ class Service:
                 raise ValueError('请先等待当前任务完成。')
             previous = dict(self.config)
             original_library, original_demo = self.library, self._demo_previous
-            self.config.update(storage_dir=str(self.root.resolve()), library=None)
+            default_root = self.root.resolve()
+            configured = self.config.get('storage_dir')
+            if configured and Path(configured).is_absolute() and Path(configured) != default_root:
+                self.config['storage_history'] = list(dict.fromkeys([*self.config['storage_history'], configured]))
+            self.config.update(storage_dir=str(default_root), library=None)
             self.library, self._demo_previous = None, None
             try:
                 self.save()
@@ -1103,9 +1463,13 @@ class Service:
                 self.config = previous
                 self.library, self._demo_previous = original_library, original_demo
                 raise
-            self.storage_root = self.root.resolve()
+            self.storage_root = default_root
             self.storage_warning = ''
+            self._storage_epoch += 1
             self._invalidate_connections()
+            if self.config['storage_history']:
+                self._storage_history_pending = True
+                self._schedule_storage_check(10)
         return self.state()
 
     def asset_tutorial(self,payload,mark=False):
@@ -1124,17 +1488,19 @@ class Service:
 
     def call(self, action, payload):
         handlers={'state':self.state, 'demo':self.demo, 'return_from_demo':self.return_from_demo,'detect':self.detect,
+                  'task_session_progress':lambda:self.task_session_progress(payload),
                   'startup_reconnect':self.startup_reconnect, 'reconnect':self.reconnect,'logout':self.logout,
                   'avatar':lambda:self.avatar(payload.get('url')),
                   'sessions':self.sessions, 'messages':lambda:self.messages(payload),
                   'qce_preview':lambda:self.qce_preview(payload),
                   'preview_media':lambda:self.preview_media(payload),
                   'archive_preferences':lambda:self.archive_preferences(payload),
-                  'storage_info':lambda:storage.storage_info(self),
+                  'storage_info':self.get_storage_info,
                   'storage_cleanup':lambda:self.storage_job('storage_cleanup'),
                   'storage_reset':self.reset_storage,
                   'connect':lambda:self.connect(payload.get('accountId')),
                   'export':lambda:self.export(payload),
+                  'last_export_sessions':self.last_export_sessions,
                   'account_assets':lambda:self.account_assets(payload),
                   'favorite_preview':lambda:self.favorite_preview(payload),
                   'refresh_assets':lambda:self.refresh_assets(payload),'export_account':lambda:self.export_account(payload),

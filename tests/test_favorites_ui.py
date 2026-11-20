@@ -1,7 +1,9 @@
 """Favorites UI and the generated offline viewer, with synthetic data only."""
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from core.favorites import FavoriteCatalog,export_favorites
@@ -86,3 +88,24 @@ class FavoritesUiTests(unittest.TestCase):
         page.locator('#print').click();page.wait_for_function('window.__printed===4')
         self.assertEqual(external,[]);self.assertEqual(errors,[])
         contents=(folder/'data.json').read_text('utf-8');self.assertEqual(len(json.loads(contents)['items']),4)
+
+    def test_long_favorite_builds_body_only_when_opened_and_search_still_finds_it(self):
+        body=''.join(f'<dataitem datatype="1"><datasrcname>发言人{i}</datasrcname><datadesc>聊天正文{i}</datadesc></dataitem>'
+                     for i in range(8))
+        with closing(sqlite3.connect(Path(self.library['root'])/'favorite/favorite.db')) as con,con:
+            con.execute('UPDATE fav_db_item SET content=? WHERE local_id=4',
+                        ('<favitem><title>聊天合集</title><datalist>'+body+'</datalist></favitem>',))
+        with self.service.read_archive() as archive:
+            folder=self.root/'mobile';folder.mkdir()
+            export_favorites(archive,self.library,{'ids':['4','2'],'articles':False},folder,ASSETS,lambda *_:None,lambda:None,lambda _:None)
+        context=ui_harness.Release125UiTests.browser.new_context(viewport={'width':410,'height':820})
+        self.addCleanup(context.close)
+        page=context.new_page();page.goto((folder/'index.html').as_uri())
+        self.assertTrue(page.evaluate('document.documentElement.scrollWidth<=innerWidth'))
+        page.locator('#query').fill('聊天正文7')
+        self.assertEqual(page.locator('.card').count(),1)
+        self.assertEqual(page.get_by_text('聊天正文7',exact=True).count(),0)
+        page.evaluate('()=>{window.print=()=>{window.__printed=document.querySelector("#moect-print-root").textContent.includes("聊天正文7")}}')
+        page.locator('#print').click();page.wait_for_function('window.__printed===true')
+        page.get_by_text('查看聊天记录',exact=True).click()
+        page.get_by_text('聊天正文7',exact=True).wait_for()

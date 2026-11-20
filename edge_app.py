@@ -57,7 +57,7 @@ class Api:
                 folders=window.create_file_dialog(webview.FileDialog.FOLDER)
                 if not folders:return {'result':{'cancelled':True}}
                 if action=='choose_output':
-                    svc.config['export_dir']=folders[0];svc.save();result=svc.state()
+                    result=svc.set_export_directory(folders[0])
                 elif action=='choose_archive':result=svc.import_archive(folders[0])
                 elif action=='choose_cache':result=svc.storage_job('storage_migrate', folders[0])
                 elif action=='choose_diagnostics':

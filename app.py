@@ -87,8 +87,7 @@ class Bridge(QObject):
                 if not folder:
                     self.send(request_id, {'cancelled':True}); return
                 if action=='choose_output':
-                    self.service.config['export_dir']=folder; self.service.save()
-                    self.send(request_id,self.service.state()); return
+                    self.send(request_id,self.service.set_export_directory(folder)); return
                 selected={'choose_archive':'import_path','choose_storage':'storage_path','choose_cache':'cache_path','choose_diagnostics':'diagnostics_path'}
                 action, payload=selected[action],{'path':folder,'id':payload.get('id')}
             if action in ('open_export','open_task_folder','open_output'):

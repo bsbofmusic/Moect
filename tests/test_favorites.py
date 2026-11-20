@@ -13,7 +13,7 @@ from unittest.mock import patch
 from xml.sax.saxutils import escape
 
 from core.data import Archive
-from core.favorites import FavoriteCatalog,export_favorites
+from core.favorites import FavoriteCatalog,FavoriteResources,export_favorites,parse_favorite
 from core.favorite_articles import ContentReader,fetch_article
 from core.service import Service
 from tests.test_resources import media_fixture,PNG,ASSETS
@@ -67,6 +67,11 @@ class FavoriteTests(unittest.TestCase):
 
     def test_catalog_filters_deleted_dates_and_query_and_does_not_cap_export_at_page_size(self):
         catalog=FavoriteCatalog(self.library)
+        with patch('core.favorites.parse_favorite',wraps=parse_favorite) as parse:
+            summary=catalog.summary({'offset':80})
+        self.assertEqual(summary['count'],96)
+        self.assertEqual(len(summary['items']),16)
+        self.assertEqual(parse.call_count,16)
         summary=catalog.summary()
         self.assertEqual(summary['count'],96);self.assertEqual(len(summary['items']),80)
         self.assertNotIn('blocks',summary['items'][0])
@@ -88,6 +93,23 @@ class FavoriteTests(unittest.TestCase):
         serialized=(out/'data.json').read_text('utf-8')+(out/'index.html').read_text('utf-8')+md
         self.assertNotIn('DO-NOT-EXPORT-KEY',serialized);self.assertNotIn('cdn_datakey',serialized)
         self.assertEqual(result['count'],4)
+
+    def test_favorite_index_only_stages_selected_files_and_rechecks_their_content(self):
+        from core.resources import ResourceStore
+        folder=self.root/'verify';folder.mkdir()
+        cache=Path(self.library['account_dir'])/'business/favorite/data/ab'
+        unrelated=cache/'unrelated'
+        unrelated.write_bytes(b'Document'*100)
+        with closing(ResourceStore(self.archive.data,'',folder)) as store:
+            resolver=FavoriteResources(store,self.library)
+            resolver.index()
+            self.assertFalse(any(path.name.startswith(('favorite-','verified-')) for path in Path(store.tmp.name).iterdir()))
+            (cache/('f'*32)).write_bytes(b'Source changed between indexing and export')
+            block=next(FavoriteCatalog(self.library).items({'ids':['2']}))['blocks'][0]
+            resolver.resolve(block)
+            self.assertEqual(block['resources'],[])
+            self.assertIn('本机未找到',block['notice'])
+            self.assertFalse(any(Path(store.tmp.name).glob('verified-*')))
 
     def test_article_parser_accepts_real_content_not_captcha_and_never_embeds_scripts(self):
         page=self.root/'article.html';page.write_text('<html><script>evil()</script><div id="js_content"><h2>标题</h2><p>第一段 <b>加粗</b></p><img data-src="https://mmbiz.qpic.cn/test.jpg"><p>末段</p></div></html>','utf-8')

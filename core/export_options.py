@@ -13,6 +13,7 @@ def export_preferences(payload):
         raise ValueError('跳过的资源类型只支持 image、video、audio、file')
     return {'include_system_messages':boolean('include_system_messages','includeSystemMessages',True),
             'include_avatars':boolean('include_avatars','includeAvatars',True) and not quick,
+            'allow_remote_media':boolean('allow_remote_media','allowRemoteMedia',False) and not quick,
             'quick_export':quick,
             'skip_resource_types':[t for t in RESOURCE_TYPES if quick or t in types]}
 

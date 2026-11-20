@@ -10,16 +10,28 @@ FIELDS = ('local_id', 'server_id', 'local_type', 'sort_seq', 'real_sender_id',
           'create_time', 'message_content', 'compress_content', 'packed_info_data')
 
 
+def time_bounds(start, end):
+    conditions, args = [], []
+    if start is not None:
+        conditions.append('create_time >= ?')
+        args.append(start)
+    if end is not None:
+        conditions.append('create_time <= ?')
+        args.append(end)
+    return conditions, args
+
+
 class Archive:
-    def __init__(self, library):
+    def __init__(self, library, *, cache_root=None, identity_from=None, session_ids=None):
+        self.session_ids = session_ids
         self.data = Wx4Data(library['root'], library.get('wxid', ''),
-                            account_dir=library.get('account_dir'))
+                            account_dir=library.get('account_dir'), identity_from=identity_from)
         try:
-            self.data.cache_root = library.get('storage_root')
+            self.data.cache_root = cache_root or library.get('storage_root')
             for con in self.data._conns.values():
                 if con:
                     con.execute('PRAGMA query_only=ON')
-            self.avatars = AvatarStore(self.data, Path(library['root']).parent/'avatar-cache')
+            self.avatars = AvatarStore.for_archive(self.data)
         except BaseException:
             self.data.close()
             raise
@@ -41,6 +53,13 @@ class Archive:
             row['avatar_url'] = self.avatars.reference(row['username'])
         return [r for r in rows if r['has_messages']]
 
+    def has_session(self, username):
+        if not isinstance(username, str) or not username:
+            return False
+        if self.session_ids is not None and username in self.session_ids:
+            return self.data.has_messages(username)
+        return any(row['username'] == username for row in self.sessions())
+
     def _raw(self, session, descending=False, before=None, start=None, end=None):
         table = self.data.msg_table_for(session)
         streams = []
@@ -52,11 +71,7 @@ class Archive:
             if not {'local_id', 'create_time', 'message_content'} <= cols:
                 raise ValueError('消息表结构不受支持，请保留原始数据并更新适配层。')
             select = ','.join(f'"{c}"' if c in cols else f'NULL AS "{c}"' for c in FIELDS)
-            clauses, args = [], []
-            if start is not None:
-                clauses.append('create_time >= ?'); args.append(start)
-            if end is not None:
-                clauses.append('create_time <= ?'); args.append(end)
+            clauses, args = time_bounds(start, end)
             if before is not None:
                 ts, old_shard, local_id = before
                 clauses.append('(create_time < ? OR (create_time = ? AND (? < ? OR (? = ? AND local_id < ?))))')
@@ -76,14 +91,16 @@ class Archive:
             for cursor in cursors:
                 cursor.close()
 
-    def messages(self, session, options=None, descending=False, before=None, cancel=None):
+    def messages(self, session, options=None, descending=False, before=None, cancel=None, on_scan=None):
         options = options or {}
         query = options.get('query', '').strip().casefold()
         kind = options.get('kind', 'all')
-        for sort_key, row, names in self._raw(session, descending, before,
-                                              options.get('start'), options.get('end')):
+        rows = self._raw(session, descending, before, options.get('start'), options.get('end'))
+        for scanned, (sort_key, row, names) in enumerate(rows):
             if cancel:
                 cancel()
+            if on_scan is not None:
+                on_scan(scanned)
             msg = self.data._build_msg(row, names, session, sort_key[1])
             if kind != 'all' and msg.get('kind') != kind:
                 continue
@@ -113,16 +130,7 @@ class Archive:
                 if offset<=total<offset+limit: result.append(msg)
                 total+=1
             return result,total
-        table=self.data.msg_table_for(session)
-        total=0
-        for con in self.data.msg_dbs:
-            if table not in self.data.tables_of(con):continue
-            where,args=[],[]
-            for key,op in [('start','>='),('end','<=')]:
-                if options.get(key) is not None:
-                    where.append('create_time '+op+' ?');args.append(options[key])
-            condition=' WHERE '+' AND '.join(where) if where else ''
-            total+=con.execute(f'SELECT count(*) FROM "{table}"{condition}',args).fetchone()[0]
+        total = self.message_count(session, options)
         result=[]
         source=self._raw(session,True,None,options.get('start'),options.get('end'))
         try:
@@ -130,6 +138,18 @@ class Archive:
                 result.append(self.data._build_msg(row,names,session,sort_key[1]))
         finally:source.close()
         return result,total
+
+    def message_count(self, session, options, cancel=lambda: None):
+        """Count source rows in the date range without parsing message bodies."""
+        table = self.data.msg_table_for(session)
+        clauses, args = time_bounds(options.get('start'), options.get('end'))
+        condition = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        total = 0
+        for con in self.data.msg_dbs:
+            cancel()
+            if table in self.data.tables_of(con):
+                total += con.execute(f'SELECT count(*) FROM "{table}"{condition}', args).fetchone()[0]
+        return total
 
 
 def validate_root(root):

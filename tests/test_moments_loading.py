@@ -71,13 +71,34 @@ class SocialExportTests(unittest.TestCase):
         with patch('core.resources.ResourceStore._copy',side_effect=AssertionError('Skip must precede cache lookup')):
             export_moments(self.archive,self.library,{'includeImages':False},no_images,ASSETS,lambda *a:None,lambda:None,lambda _:None)
 
+    def test_repeated_moment_reference_reuses_the_same_verified_conversion(self):
+        post=next(p for p in MomentsCatalog(self.library,USER).posts() if p['id']=='100')
+        folder=self.root/'duplicates';folder.mkdir()
+        with closing(ResourceStore(self.archive.data,'',folder)) as store:
+            resolver=MomentResources(store)
+            with patch.object(store.codec,'image',wraps=store.codec.image) as image:
+                first=resolver.resolve(post['media'][0],True,True)
+                count=image.call_count
+                again=resolver.resolve(post['media'][0],True,True)
+            self.assertGreater(count,0)
+            self.assertEqual(image.call_count,count)
+            self.assertEqual(first,again)
+            self.assertEqual((folder/first['resources'][0]['path']).read_bytes(),PNG)
+            self.assertEqual(store.stats['available'],2)
+
     def test_moments_preview_and_export_without_dates_are_local_and_do_not_enqueue_refresh(self):
         service=Service(ASSETS,self.root/'local-state');service.library=service.config['library']=self.library;service.config['export_dir']=str(self.root/'exports')
         try:
             with patch('core.resources.ResourceStore._download',side_effect=AssertionError('Local Moments must not download')):
-                preview=service.account_assets({'kind':'moments'})
+                with patch('core.account_assets.moment_from_row',wraps=moment_from_row) as parse:
+                    preview=service.account_assets({'kind':'moments'})
+                    self.assertEqual(parse.call_count,3)  # Includes a row whose XML author does not match.
+                    self.assertEqual(service.account_assets({'kind':'moments'}),preview)
+                    self.assertEqual(parse.call_count,3)
                 self.assertEqual(preview['count'],2);self.assertEqual(service.state()['tasks'],[])
                 self.assertTrue(next(p for p in preview['posts'] if p['id']=='100')['thumbnails'][0].startswith('data:image/jpeg;base64,'))
+                self.assertTrue(list((service.storage_root/'previews').glob('moments-*.jpg')))
+                self.assertFalse((Path(self.library['root']).parent/'moments-thumbnails').exists())
                 service.export_account({'kind':'moments'});service.pool.shutdown(wait=True)
             self.assertEqual(service.state()['tasks'][0]['status'],'completed')
         finally:service.shutdown()

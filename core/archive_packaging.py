@@ -5,6 +5,7 @@ import os
 import zipfile
 from pathlib import Path
 from ctypes import wintypes
+from time import localtime
 
 
 def protect_password(value, decrypt=False):
@@ -82,35 +83,62 @@ def export_options(current, payload):
     return options, password
 
 
-def package_folder(folder, destination, password, cancel, status):
-    folder, destination = Path(folder).resolve(), Path(destination)
-    files = []
+def archive_files(folder, cancel):
+    folder = Path(folder).resolve()
     for path in folder.rglob('*'):
         cancel()
         if path.is_symlink() or not path.resolve().is_relative_to(folder):
             raise ValueError('归档目录包含无效的链接文件。')
         if path.is_file():
-            files.append(path)
+            yield path, path.stat().st_size
+
+
+def package_folder(folder, destination, password, cancel, status, progress=lambda _: None, *, root_name=None, files=None):
+    folder, destination = Path(folder).resolve(), Path(destination)
+    if files is None:
+        files = list(archive_files(folder, cancel))
+    total = max(1, sum(size for _, size in files))
+    processed = 0
+    last_percent = -1
+    def advance(size):
+        nonlocal processed, last_percent
+        processed += size
+        percent = min(100, processed * 50 // total)
+        if percent != last_percent:
+            last_percent = percent
+            progress(percent / 100)
     if password:
         import pyzipper
         archive = pyzipper.AESZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED,
                                      compresslevel=6, encryption=pyzipper.WZ_AES, allowZip64=True)
         archive.setpassword(password)
         archive.setencryption(pyzipper.WZ_AES, nbits=256)
+        entry_type = archive.zipinfo_cls
     else:
         archive = zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True)
+        entry_type = zipfile.ZipInfo
+    already_compressed = {'.jpg','.jpeg','.png','.gif','.webp','.mp4','.mov','.webm','.mkv','.mp3','.m4a','.flac'}
     try:
         with archive:
-            for number, path in enumerate(sorted(files), 1):
+            for number, (path, size) in enumerate(sorted(files), 1):
                 cancel()
                 status('正在压缩 %d / %d 个文件…' % (number, len(files)))
-                with path.open('rb') as source, archive.open(path.relative_to(folder).as_posix(), 'w', force_zip64=True) as target:
+                member = path.relative_to(folder).as_posix()
+                if root_name:
+                    member = root_name + '/' + member
+                if path.suffix.lower() in already_compressed:
+                    entry = entry_type(member, date_time=localtime()[:6])
+                    entry.compress_type = zipfile.ZIP_STORED
+                    entry.file_size = size
+                    member = entry
+                with path.open('rb') as source, archive.open(member, 'w', force_zip64=True) as target:
                     while True:
                         cancel()
                         block = source.read(1024 * 1024)
                         if not block:
                             break
                         target.write(block)
+                        advance(len(block))
         status('正在校验压缩包完整性…')
         reader = pyzipper.AESZipFile if password else zipfile.ZipFile
         with reader(destination) as verified:
@@ -120,24 +148,26 @@ def package_folder(folder, destination, password, cancel, status):
                 with verified.open(entry) as source:
                     while True:
                         cancel()
-                        if not source.read(1024 * 1024):
+                        block = source.read(1024 * 1024)
+                        if not block:
                             break
+                        advance(len(block))
         cancel()
+        progress(1)
     except BaseException:
         destination.unlink(missing_ok=True)
         raise
 
 
-def folder_sizes(folder):
+def folder_sizes(folder, cancel=lambda: None, *, files=None):
     result = {'bytes': 0, 'resources': {}}
-    folder = Path(folder)
-    for path in folder.rglob('*'):
-        if path.is_file() and not path.is_symlink():
-            size = path.stat().st_size
-            result['bytes'] += size
-            parts = path.relative_to(folder).parts
-            if 'resources' in parts:
-                index = parts.index('resources')
-                category = parts[index + 1] if len(parts) > index + 2 else 'other'
-                result['resources'][category] = result['resources'].get(category, 0) + size
+    folder = Path(folder).resolve()
+    for path, size in (archive_files(folder, cancel) if files is None else files):
+        cancel()
+        result['bytes'] += size
+        parts = path.relative_to(folder).parts
+        if 'resources' in parts:
+            index = parts.index('resources')
+            category = parts[index + 1] if len(parts) > index + 2 else 'other'
+            result['resources'][category] = result['resources'].get(category, 0) + size
     return result

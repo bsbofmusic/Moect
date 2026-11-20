@@ -4,11 +4,12 @@ import json
 import os
 import base64
 import time
+from collections import OrderedDict
 from datetime import datetime,timezone,timedelta
 from pathlib import Path
 from itertools import chain
 
-from .account_assets import StickerCatalog,MomentsCatalog,HASH,moment_selection
+from .account_assets import StickerCatalog,MomentsCatalog,HASH,moment_selection,moment_preview
 from .avatars import image_type
 from .exporting import safe_name,clean
 from .resources import ResourceStore
@@ -18,6 +19,7 @@ from .version import APP_NAME,VERSION
 from .sns_codec import sns_variants
 from .themes import theme_archive,archive_theme
 from .inline_faces import ArchiveFaces
+from .paths import atomic_write_bytes
 
 
 def write_collection(folder,assets,data,cancel=lambda:None):
@@ -85,8 +87,11 @@ class MomentResources:
         self.resources=resources;self.index=None;self.cache=Path(cache).resolve() if cache else None;self.cached={}
         self.index_seconds=index_seconds;self.max_image_bytes=max_image_bytes
         self.key_samples=None;self.last_failure=None
+        self.converted=OrderedDict()
         if self.cache and (self.cache/'media.json').is_file():
-            try:self.cached=json.loads((self.cache/'media.json').read_text(encoding='utf-8'))
+            try:
+                cache_data=json.loads((self.cache/'media.json').read_text(encoding='utf-8'))
+                if isinstance(cache_data,dict):self.cached=cache_data
             except (OSError,ValueError):pass
 
     @staticmethod
@@ -108,10 +113,10 @@ class MomentResources:
                         for name in files:
                             if time.monotonic()>=deadline:break
                             p=Path(directory)/name
-                            if p.is_symlink() or not p.resolve().is_relative_to(account):continue
                             stem=p.stem.lower()
                             digest=stem if HASH.fullmatch(stem) else (p.parent.name+stem).lower()
-                            if HASH.fullmatch(digest):self.index.setdefault(digest,[]).append(p)
+                            if HASH.fullmatch(digest) and not p.is_symlink() and p.resolve().is_relative_to(account):
+                                self.index.setdefault(digest,[]).append(p)
         result=[]
         for digest in hints.get('hashes',[]):
             for path in self.index.get(digest,[]):
@@ -124,8 +129,19 @@ class MomentResources:
         store=self.resources
         self.last_failure={'status':'corrupt','reason':'image_decode_failed'}
         try:
-            if path.stat().st_size>(256*1024*1024 if kind=='video' else self.max_image_bytes):
+            stat = path.stat()
+            if stat.st_size>(256*1024*1024 if kind=='video' else self.max_image_bytes):
                 self.last_failure={'status':'unsupported','reason':'file_too_large'};return None
+            identity=(path,kind,bool(hints.get('animated')),stat.st_size,stat.st_mtime_ns)
+            if identity in self.converted:
+                self.converted.move_to_end(identity)
+                store.stats['available']+=1
+                return dict(self.converted[identity])
+
+            def remember(resource):
+                self.converted[identity]=dict(resource)
+                if len(self.converted)>1024:self.converted.popitem(last=False)
+                return resource
             if kind=='video':
                 with path.open('rb') as stream:signature=media_type(stream.read(32))
                 original=path
@@ -144,7 +160,7 @@ class MomentResources:
                             output.write(block)
                     path=target
                 result=store.codec.video(path,Path(store.tmp.name)/'sns-playback.mp4')
-                if result:return store._copy(result,'video',extension='.mp4',identity_source=original)
+                if result:return remember(store._copy(result,'video',extension='.mp4',identity_source=original))
             else:
                 raw=path.read_bytes()
                 if raw.startswith((b'\x07\x08V1',b'\x07\x08V2')):
@@ -155,14 +171,14 @@ class MomentResources:
                         self.key_samples=recent_image_samples(store.data,store.cancel) if store.keys.scan_remaining>0 else []
                     decoded=store.keys.decode(raw,path,self.key_samples,hints.get('keys',[]))
                     image=store.keys.rendered or (store.codec.image(decoded) if decoded else None)
-                    if image:return store._copy(path,'image',image,'.'+image_type(image)[0])
+                    if image:return remember(store._copy(path,'image',image,'.'+image_type(image)[0]))
                     reason=store.keys.reason or 'image_decode_failed'
                     self.last_failure={'status':'encrypted' if reason in ('aes_key_unavailable','xor_unresolved') else 'corrupt',
                                        **store.keys.diagnostics,'reason':reason}
                     return None
                 for blob in chain((raw,),sns_variants(raw,hints.get('stream_keys',[]),store.cancel),encrypted_media_variants(raw,hints.get('keys',[]),store.cancel)):
                     image=(store.codec.sticker if hints.get('animated') else store.codec.image)(blob)
-                    if image:return store._copy(path,'image',image,'.'+image_type(image)[0])
+                    if image:return remember(store._copy(path,'image',image,'.'+image_type(image)[0]))
         except OSError:self.last_failure={'status':'missing','reason':'local_file_unreadable'}
         except ValueError:pass
         return None
@@ -171,14 +187,17 @@ class MomentResources:
         store=self.resources;kind=item['kind'];hints=item['_media']
         if (kind=='image' and not include_images) or (kind=='video' and not include_videos):
             store.stats['skipped']+=1;return {'kind':kind,'status':'skipped','resources':[]}
-        cached=self.cached.get(self.media_key(item))
+        cached=self.cached.get(self.media_key(item)) if self.cached else None
         if cached and self.cache:
             copied=[]
             for resource in cached.get('resources',[]):
-                source=(self.cache/resource['path']).resolve()
-                if not source.is_relative_to(self.cache) or not source.is_file():continue
-                if resource['kind']=='image' and source.stat().st_size>self.max_image_bytes:continue
-                result=store._copy(source,resource['kind'],extension=source.suffix)
+                try:
+                    source=(self.cache/resource['path']).resolve()
+                    if not source.is_relative_to(self.cache) or not source.is_file():continue
+                    if resource['kind']=='image' and source.stat().st_size>self.max_image_bytes:continue
+                    result=store._copy(source,resource['kind'],extension=source.suffix)
+                except OSError:
+                    continue
                 if result:
                     if resource.get('role'):result['role']=resource['role']
                     copied.append(result)
@@ -203,41 +222,49 @@ class MomentResources:
         store.stats['missing']+=1;return {'kind':kind,'status':'missing','resources':[]}
 
 
-def local_moments_previews(archive,library,selection,start=None,end=None):
+def local_moments_previews(archive,library,posts):
     """Read local media only. No WeChat UI, process scan or network request."""
+    if not posts:return []
     import io
     import tempfile
-    import time
     from PIL import Image
-    posts=[]
-    for post in MomentsCatalog(library,archive.profile()['wxid'],selection['scope'],selection['author_id']).posts():
-        if start is not None and post['create_time']<start or end is not None and post['create_time']>end:continue
-        posts.append(post)
-        if len(posts)>=12:break
-    previews=[];cache=Path(library['root']).parent/'moments-thumbnails';deadline=time.monotonic()+6
+    previews=[];legacy_cache=Path(library['root']).parent/'moments-thumbnails';deadline=time.monotonic()+6
+    cache_root=getattr(archive.data,'cache_root',None)
+    cache=Path(cache_root)/'previews' if cache_root else legacy_cache
+    scope=str(Path(library.get('account_dir') or library['root']).resolve())
     with tempfile.TemporaryDirectory(prefix='moect-moments-preview-') as temporary:
         resources=ResourceStore(archive.data,'',Path(temporary),options={'includeAvatars':False})
         resources.keys.scan_remaining=0 # Previews reuse saved credentials; no process scans.
         resolver=MomentResources(resources,Path(library.get('assets_root') or library['root'])/'preview',index_seconds=2,max_image_bytes=8*1024*1024)
         try:
             for post in posts:
-                item={k:post.get(k) for k in ('id','author','text','title','create_time','status')}
-                item['author_name']=archive.data.name_of(post['author']) or post['author'];item['thumbnails']=[];item['media_status']=[]
+                item=moment_preview(post,archive.data.name_of);item['thumbnails']=[];item['media_status']=[]
                 item['image_count']=sum(m['kind']=='image' for m in post['media'][:9])
                 for media in post['media'][:9]:
                     if media['kind']!='image':continue
                     marker=hashlib.sha256((str(library.get('assets_revision',''))+MomentResources.media_key(media)).encode()).hexdigest()
-                    target=cache/(marker+'.jpg');blob=None
+                    legacy=legacy_cache/(marker+'.jpg')
+                    token=hashlib.sha256((scope+'\0'+marker).encode()).hexdigest()
+                    target=cache/('moments-'+token+'.jpg') if cache_root else legacy
+                    blob=None
+                    for source in dict.fromkeys((target,legacy)):
+                        try:
+                            with source.open('rb') as stream:
+                                value=stream.read(128*1024+1)
+                            if 0<len(value)<=128*1024:
+                                blob=value
+                                break
+                        except OSError:
+                            continue
                     try:
-                        if target.is_file() and target.stat().st_size<=128*1024:blob=target.read_bytes()
-                        elif time.monotonic()<deadline:
+                        if blob is None and time.monotonic()<deadline:
                             result=resolver.resolve(media,True,False)
                             item['media_status'].append(result['status'])
                             for resource in result['resources']:
                                 if resource['kind']!='image':continue
                                 with Image.open(Path(temporary)/resource['path']) as image:
                                     image.seek(0);image.thumbnail((220,220));output=io.BytesIO();image.convert('RGB').save(output,format='JPEG',quality=72)
-                                blob=output.getvalue();cache.mkdir(parents=True,exist_ok=True);target.write_bytes(blob);break
+                                blob=output.getvalue();cache.mkdir(parents=True,exist_ok=True);atomic_write_bytes(target,blob);break
                     except (OSError,ValueError):pass
                     if blob:item['thumbnails'].append('data:image/jpeg;base64,'+base64.b64encode(blob).decode())
                 previews.append(item)
@@ -254,18 +281,22 @@ def export_moments(archive,library,payload,folder,assets,progress,cancel,status)
         notice='范围：'+selection['label']+'。包含本次已整理的可访问动态、评论和点赞；微信权限和资源有效期可能使结果不完整。HTML 内可按作者和时间继续筛选本次归档。')
     resources=ResourceStore(archive.data,'',folder,cancel,status,{'includeAvatars':False})
     resolver=MomentResources(resources,Path(library.get('assets_root') or library['root'])/'preview')
+    avatars={}
+    def avatar(uid):
+        if uid and uid not in avatars:
+            avatars[uid]=archive.avatars.export(uid,folder) or ''
+        return avatars.get(uid,'')
+
     start=payload.get('_start');end=payload.get('_end');count=0
     try:
-        for post in catalog.posts(cancel):
-            cancel()
-            if (start is not None and post['create_time']<start) or (end is not None and post['create_time']>end):continue
+        for post in catalog.posts(cancel,start=start,end=end):
             count+=1;progress(count,0);item=clean(post);item['resources']=[];item['media_status']=[];item['media_diagnostics']=[]
             item['author_name']=archive.data.name_of(post['author']) or post['author']
-            item['author_avatar']=archive.avatars.export(post['author'],folder) or ''
+            item['author_avatar']=avatar(post['author'])
             for person in item.get('likes',[])+item.get('comments',[]):
                 cancel();uid=person['uid'];contact=archive.data.contacts.get(uid) or {}
                 person['name']=contact.get('remark') or contact.get('nick_name') or person['name'] or uid
-                person['avatar']=archive.avatars.export(uid,folder) if uid else ''
+                person['avatar']=avatar(uid)
                 if person.get('reply_uid'):
                     person['reply_name']=archive.data.name_of(person['reply_uid']) or person.get('reply_name') or person['reply_uid']
             for source,comment in zip(post.get('comments',[]),item.get('comments',[])):

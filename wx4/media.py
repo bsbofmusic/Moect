@@ -108,9 +108,12 @@ def infer_xor_key(data, prefix=b''):
 def decode_dat(data: bytes, aes_key: bytes | None=None, xor_key: int | None=None):
     if image_prefix(data):return data
     if data[:6] not in (SIG_V1,SIG_V2):
-        for k in range(256):
+        if not data:return None
+        # Each supported signature fixes the XOR byte from the first byte.
+        # Keep numeric order for legacy files that match more than one prefix.
+        for k in sorted({data[0]^magic[0] for magic,_ in IMG_EXT}):
             if image_prefix(bytes(b^k for b in data[:16])):
-                return bytes(b^k for b in data)
+                return data.translate(bytes(value^k for value in range(256)))
         return None
     key=V1_KEY if data[:6]==SIG_V1 else aes_key
     if not key or len(key)!=16:return None

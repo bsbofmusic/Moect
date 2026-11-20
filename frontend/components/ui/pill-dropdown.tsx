@@ -6,18 +6,21 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "./dropdown-menu"
 
 export function PillDropdown<T extends string>({
   value,
   onChange,
   options,
+  leadingAction,
   disabled,
   align = "end",
 }: {
   value: T
   onChange: (v: T) => void
   options: { value: T; label: string }[]
+  leadingAction?: { label: string; disabled?: boolean; onSelect: () => void }
   disabled?: boolean
   align?: "start" | "center" | "end"
 }) {
@@ -35,6 +38,12 @@ export function PillDropdown<T extends string>({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align={align} className="min-w-[140px]">
+        {leadingAction && <>
+          <DropdownMenuItem disabled={leadingAction.disabled} onSelect={leadingAction.onSelect}>
+            {leadingAction.label}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>}
         {options.map((o) => (
           <DropdownMenuItem
             key={o.value}

@@ -56,6 +56,7 @@ export interface BatchExportConfig {
   includeSystemMessages: boolean
   quickExport: boolean
   includeAvatars: boolean
+  allowRemoteMedia: boolean
   skipDownloadResourceTypes?: SkipDownloadResourceType[]
   outputDir: string
   keywords: string
@@ -97,6 +98,7 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
   const [includeSystemMessages, setIncludeSystemMessages] = useState(true)
   const [quickExport, setQuickExport] = useState(false)
   const [includeAvatars, setIncludeAvatars] = useState(true)
+  const [allowRemoteMedia, setAllowRemoteMedia] = useState(false)
   const [skipDownloadResourceTypes, setSkipDownloadResourceTypes] = useState<SkipDownloadResourceType[] | undefined>(undefined)
   const [outputDir, setOutputDir] = useState('')
   const [keywords, setKeywords] = useState('')
@@ -125,6 +127,7 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
       setIncludeSystemMessages(true)
       setQuickExport(false)
       setIncludeAvatars(true)
+      setAllowRemoteMedia(false)
       setSkipDownloadResourceTypes(undefined)
       setOutputDir('')
       setKeywords('')
@@ -194,7 +197,7 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
       format, timeRange,
       customStartDate: timeRange === 'custom' ? customStartDate : undefined,
       customEndDate: timeRange === 'custom' ? customEndDate : undefined,
-      includeSystemMessages, quickExport, includeAvatars,
+      includeSystemMessages, quickExport, includeAvatars, allowRemoteMedia: allowRemoteMedia && !quickExport,
       skipDownloadResourceTypes: skipDownloadResourceTypes || [],
       outputDir, keywords, archiveZip, archiveEncrypt, archivePassword:archivePassword||undefined,
     }
@@ -391,6 +394,7 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
                     {type:'audio', title:'不导出语音', description:'不提取或下载语音文件，保留对应的语音消息记录。'},
                   ] as const).map(option=><ExportSwitch key={option.type} id={'skip-'+option.type} title={option.title} description={option.description} checked={quickExport || !!skipDownloadResourceTypes?.includes(option.type)} disabled={isExporting || quickExport} onChange={enabled=>setSkipDownloadResourceTypes(current=>toggleSkipResourceType(current,option.type,enabled))}/>)}
                   <ExportSwitch id="include-avatars" title="导出头像" description="将可用头像一起保存到归档中；关闭后使用姓名首字作为占位。" checked={includeAvatars && !quickExport} onChange={setIncludeAvatars} disabled={isExporting || quickExport}/>
+                  <ExportSwitch id="allow-remote-media" title="联网补下载附件" description="默认读取本机已有资源。开启后，可尝试下载仍有有效链接的附件和头像。" checked={allowRemoteMedia && !quickExport} onChange={setAllowRemoteMedia} disabled={isExporting || quickExport}/>
                 </div>
               </section>
 

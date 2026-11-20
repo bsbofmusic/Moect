@@ -23,15 +23,14 @@
 [![系统](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-8771cf?labelColor=282333&style=flat-square)](docs/usage.md)
 [![许可证](https://img.shields.io/badge/license-GPL--3.0-8771cf?labelColor=282333&style=flat-square)](LICENSE)
 
-## 1.3.0 更新
+## 1.3.1 更新
 
-- 新增收藏导出（测试），支持筛选、预览，以及 HTML、Markdown 和可用附件归档。
-- 重做入门、朋友圈与表情包教程，补充恢复图片读取的操作指引。
-- 优化图片、语音与表情读取，支持官方骰子、猜拳结果的预览和导出。
-- 完善群系统消息及历史群聊读取，优化设置、关于等页面的布局和字体。
-- 新增六档缓存上限，启动后按时间清理过期缓存，设置和说明隐藏状态可记忆。
+- 批量导出按系统负载并行处理。展开一条批量任务，可查看每个会话的进度和结果。
+- 一批会话保存到同一个目录，开启压缩时生成一个 ZIP。会话页可用「上一次导出」恢复上次的勾选。
+- 支持在会话预览中直接播放 FLAC，改善早期微信 SILK 语音的导出。
+- 修复缓存位置迁移和旧副本清理，优化朋友圈、收藏和会话预览的加载，以及收藏归档的布局。
 
-[查看完整更新说明](docs/release-1.3.0.md)
+[查看完整更新说明](docs/release-1.3.1.md)
 
 ## 特性
 
@@ -68,7 +67,7 @@
 1. 下载 [Moect 一键安装包](https://github.com/mofan6/Moect/releases/latest)，双击后选择安装位置及是否创建桌面快捷方式，再点击“安装”。开始菜单入口会自动创建；缺少 WebView2 时会自动准备运行环境，此时需要联网。
 2. 打开并登录电脑微信，然后启动 Moect，点击“连接微信”。也可以打开已有解密备份，或先体验虚构的演示数据。
 3. 点击会话查看记录，选择导出格式、时间范围及可选的压缩加密设置，创建任务。
-4. 导出完成后，在任务页面直接打开文件。HTML 打开即进入对话，批量导出可在顶部切换会话，顶栏可收起或展开。短消息气泡随内容收紧，长链接自动换行。
+4. 导出完成后，在任务页面打开文件。单个会话的 HTML 直接进入对话，批量导出的 HTML 从总目录选择会话。聊天页顶栏可收起或展开。
 
 完整保留导出文件夹里的 HTML、消息分片和资源目录，才能在离线电脑上继续查看媒体。
 
@@ -91,7 +90,6 @@ python -m venv .venv
 pip install -r requirements.txt
 npm ci --prefix frontend
 npm run build --prefix frontend
-Copy-Item ui/icon.svg ui-qce/icon.svg
 python build.py
 # 安装 Inno Setup 6.5+ 后生成一键安装包
 .\installer\build.ps1 -OutputDirectory .\release

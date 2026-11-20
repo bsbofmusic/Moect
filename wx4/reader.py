@@ -257,7 +257,7 @@ class Wx4Data:
     """解密后数据的统一访问入口。"""
 
     def __init__(self, decrypted_dir: str, wxid: str = "", progress=None,
-                 account_dir: str | None = None):
+                 account_dir: str | None = None, *, identity_from=None):
         self.root = decrypted_dir
         self.wxid = wxid
         self.progress = progress or (lambda m: None)
@@ -265,7 +265,9 @@ class Wx4Data:
         # 显式指定；否则按 <decrypted_dir>/.. 猜。
         self._account_dir = account_dir
         self._conns: dict[str, sqlite3.Connection | None] = {}
+        self._db_locations: dict[str, str] = {}
         self._tables: dict[int, set] = {}
+        self._names_by_db: dict[sqlite3.Connection, dict] = {}
         self.contacts: dict[str, dict] = {}
         self.room_members: dict[str, list[str]] = {}
         self.rooms: dict[str, dict] = {}
@@ -274,8 +276,17 @@ class Wx4Data:
         self.media_dbs: list[sqlite3.Connection] = []
         try:
             self._scan_dbs()
-            self._load_contacts()
-            self._load_rooms()
+            if identity_from is None or identity_from.root != self.root:
+                self._load_contacts()
+                self._load_rooms()
+            else:
+                # Batch workers read the same snapshot. Identity lookups are
+                # read-only, while the SQLite connections stay worker-local.
+                self.contacts = identity_from.contacts
+                self.rooms = identity_from.rooms
+                self.room_members = identity_from.room_members
+                self.me = identity_from.me
+                self.wxid = identity_from.wxid
         except BaseException:
             self.close()
             raise
@@ -284,20 +295,16 @@ class Wx4Data:
     def _scan_dbs(self):
         msg_found: list[tuple[str, sqlite3.Connection]] = []
         media_found: list[tuple[str, sqlite3.Connection]] = []
-        for root, _dirs, files in os.walk(self.root):
-            for f in files:
-                if not f.endswith(".db"):
-                    continue
-                rel = os.path.relpath(os.path.join(root, f), self.root)
-                base = re.sub(r"\s*\([^)]*\)\.db$", ".db", f)   # 时间戳副本
-                con = self._open(rel)
-                if con is None:
-                    continue
-                if re.match(r"^message_(\d+)?\.db$", base) or \
-                   re.match(r"^biz_message_(\d+)?\.db$", base):
-                    msg_found.append((rel, con))
-                elif re.match(r"^media_(\d+)?\.db$", base):
-                    media_found.append((rel, con))
+        for rel in self._iter_db_rel():
+            base = re.sub(r"\s*\([^)]*\)\.db$", ".db", os.path.basename(rel))
+            self._db_locations.setdefault(base, rel)
+            con = self._open(rel)
+            if con is None:
+                continue
+            if re.fullmatch(r"(?:biz_)?message_\d*\.db", base):
+                msg_found.append((rel, con))
+            elif re.fullmatch(r"media_\d*\.db", base):
+                media_found.append((rel, con))
         msg_found.sort(key=lambda x: x[0])
         media_found.sort(key=lambda x: x[0])
         self.msg_dbs = [c for _rel, c in msg_found]
@@ -326,11 +333,7 @@ class Wx4Data:
 
     def _db_rel(self, name_no_ext: str) -> str | None:
         """精确匹配（忽略时间戳副本后缀）。"""
-        for rel in self._iter_db_rel():
-            base = re.sub(r"\s*\([^)]*\)\.db$", ".db", os.path.basename(rel))
-            if base == name_no_ext + ".db":
-                return rel
-        return None
+        return self._db_locations.get(name_no_ext + ".db")
 
     def _iter_db_rel(self):
         for root, _dirs, files in os.walk(self.root):
@@ -349,7 +352,9 @@ class Wx4Data:
                 except sqlite3.Error:
                     pass
         self._conns.clear()
+        self._db_locations.clear()
         self._tables.clear()
+        self._names_by_db.clear()
         self.msg_dbs.clear()
         self.media_dbs.clear()
 
@@ -539,12 +544,14 @@ class Wx4Data:
             return 'Msg_' + username[10:]
         return "Msg_" + hashlib.md5(username.encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _name2id(con) -> dict:
+    def _name2id(self, con) -> dict:
+        if con in self._names_by_db:
+            return self._names_by_db[con]
         try:
-            return {r[0]: r[1] for r in con.execute("select rowid,user_name from Name2Id")}
+            self._names_by_db[con] = {r[0]: r[1] for r in con.execute("select rowid,user_name from Name2Id")}
         except sqlite3.Error:
             return {}
+        return self._names_by_db[con]
 
     def has_messages(self, username: str) -> bool:
         t = self.msg_table_for(username)

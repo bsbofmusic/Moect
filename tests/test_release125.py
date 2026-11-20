@@ -48,6 +48,7 @@ class PackagingTests(unittest.TestCase):
     def test_plain_and_aes_archives_are_verified_and_preserve_unicode_paths(self):
         source = self.root/'source';source.mkdir()
         (source/'中文 # 100%.html').write_text('<p>合成聊天</p>', encoding='utf-8')
+        (source/'已压缩.mp4').write_bytes(b'synthetic media payload')
         for password in (None, b'synthetic-password'):
             target = self.root/('encrypted.zip' if password else 'plain.zip')
             package_folder(source, target, password, lambda: None, lambda _: None)
@@ -59,6 +60,8 @@ class PackagingTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         archive.read('中文 # 100%.html', pwd=b'wrong')
                 self.assertIn('合成聊天', archive.read('中文 # 100%.html').decode())
+                self.assertEqual(archive.getinfo('已压缩.mp4').compress_type, zipfile.ZIP_STORED)
+                self.assertEqual(archive.read('已压缩.mp4'), b'synthetic media payload')
         self.assertTrue((source/'中文 # 100%.html').is_file())
 
     def test_cancelled_compression_removes_only_partial_zip(self):
@@ -193,13 +196,93 @@ class StorageAndDiagnosticsTests(unittest.TestCase):
         self.assertTrue(current.is_relative_to(target))
         self.assertTrue((current/'session/session.db').is_file())
         self.assertTrue((old_root/'config.json').is_file())
+        self.assertFalse((old_root/'archives').exists())
+        self.assertEqual(self.service.config['storage_history'], [])
+        self.assertEqual([item['path'] for item in storage.storage_info(self.service)['roots']], [str(target)])
         self.execute('storage_cleanup')
         self.assertTrue(current.is_dir())
         self.assertFalse((target/'archives/account/snapshot_000000000000').exists())
         self.assertFalse(self.expired.exists())
-        self.assertTrue((old_root/'archives/account/keys.json').is_file())
         self.assertTrue((target/'archives/account/keys.json').is_file())
         self.assertFalse(self.service._maintenance)
+
+    def test_old_copy_blocked_by_windows_is_retried_without_losing_unique_data(self):
+        old_root = self.service.root
+        key = old_root/'archives/account/keys.json'
+        unrelated = old_root/'unrelated.txt'
+        unrelated.write_text('unrelated', encoding='utf-8')
+        unlink = Path.unlink
+
+        def blocked(path, *args, **kwargs):
+            if path == key:
+                raise PermissionError('Synthetic sharing violation')
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, 'unlink', blocked):
+            job = self.execute('storage_migrate', str(self.root/'target'))
+        self.assertIn('仍有保留文件', job['detail'])
+        self.assertEqual(self.service.config['storage_history'], [str(old_root)])
+        unique = key.parent/'old-account-keys.json'
+        unique.write_text('only copy', encoding='utf-8')
+
+        self.execute('storage_cleanup')
+        self.assertFalse(key.exists())
+        self.assertTrue(unique.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue((self.service.storage_root/key.relative_to(old_root)).exists())
+        counterpart = self.service.storage_root/unique.relative_to(old_root)
+        counterpart.write_bytes(unique.read_bytes())
+        self.execute('storage_cleanup')
+        self.assertEqual(self.service.config['storage_history'], [])
+        self.assertFalse(unique.exists())
+        self.assertTrue(counterpart.exists())
+
+    def test_migration_can_share_an_export_parent_and_return_to_default_disk(self):
+        parent = Path(self.service.config['export_dir'])
+        parent.mkdir()
+        self.assertEqual(self.service.set_export_directory(parent)['export_dir'],str(parent))
+        export = parent/'kept.html'
+        export.write_bytes(b'existing export')
+        self.execute('storage_migrate', parent)
+        chosen = self.service.storage_root
+        self.assertEqual(chosen.parent, parent)
+        with self.assertRaisesRegex(ValueError,'缓存目录之外'):
+            self.service.set_export_directory(chosen/'previews'/'exports')
+        job = self.execute('storage_migrate', chosen)
+        self.assertIn('已在使用', job['detail'])
+        self.assertEqual(self.service.storage_root, chosen)
+        self.execute('storage_migrate', self.service.root)
+        self.assertEqual(self.service.storage_root.parent, self.service.root)
+        self.assertFalse(chosen.exists())
+        self.assertEqual(export.read_bytes(), b'existing export')
+        self.assertTrue((Path(self.service.library['root'])/'session/session.db').is_file())
+
+    def test_startup_moves_legacy_media_credentials_without_overwriting_active_values(self):
+        old = self.service.root
+        self.execute('storage_migrate', self.root/'target')
+        missing = 'media-cache/' + 'a'*64 + '/emoticon-key.bin'
+        conflict = 'media-cache/' + 'b'*64 + '/emoticon-key.bin'
+        for location, name, value in (
+            (old, missing, b'o'*16), (old, conflict, b'o'*16),
+            (self.service.storage_root, conflict, b'n'*16),
+        ):
+            path = location/name
+            path.parent.mkdir(parents=True)
+            path.write_bytes(value)
+        self.service.config['storage_history'] = [str(old)]
+        self.service.save()
+        with patch('core.service.threading.Timer') as timer:
+            restarted = Service(ASSETS, old)
+        self.addCleanup(restarted.shutdown)
+        timer.assert_called_once()
+        with patch.object(restarted.pool, 'submit') as submit:
+            restarted._queue_storage_check()
+        submit.call_args.args[0]()
+        self.assertEqual((restarted.storage_root/missing).read_bytes(), b'o'*16)
+        self.assertFalse((old/missing).exists())
+        self.assertEqual((restarted.storage_root/conflict).read_bytes(), b'n'*16)
+        self.assertEqual((old/conflict).read_bytes(), b'o'*16)
+        self.assertFalse(restarted._maintenance)
 
     def test_migration_rolls_back_on_config_failure_and_rejects_source_overlap(self):
         job = self.service._new_job('storage_migrate', 'Synthetic migration')
@@ -212,6 +295,22 @@ class StorageAndDiagnosticsTests(unittest.TestCase):
         self.assertTrue(Path(self.library['root']).is_dir())
         with self.assertRaises(ValueError):
             storage.migrate(self.service, self.service.root/'nested', job)
+
+    def test_cancelling_old_copy_cleanup_keeps_an_already_committed_migration(self):
+        old = Path(self.library['root'])
+        with patch.object(self.service.pool,'submit') as submit:
+            response = self.service.storage_job('storage_migrate', self.root/'new')
+        function, job, work = submit.call_args.args
+        def cancel_at_cleanup(service, check, *args):
+            service.cancel(response['job'])
+            check()
+        with patch('core.storage.reconcile_storage_history', side_effect=cancel_at_cleanup):
+            function(job, work)
+        self.assertEqual(job['status'],'completed',job['detail'])
+        self.assertIn('已切换到新位置',job['detail'])
+        self.assertTrue(old.is_dir())
+        self.assertTrue(Path(self.service.library['root']).is_relative_to(self.service.storage_root))
+        self.assertIn(str(self.service.root),self.service.config['storage_history'])
 
     def test_storage_management_waits_for_pending_exports_and_cache_readers(self):
         self.service._new_job('export', 'Synthetic queued export')
@@ -235,12 +334,35 @@ class StorageAndDiagnosticsTests(unittest.TestCase):
 
     def test_unavailable_cache_location_can_reset_without_deleting_data(self):
         self.service.storage_warning = 'Synthetic unavailable disk'
+        configured = self.root/'formerly-mounted'
+        self.service.config['storage_dir'] = str(configured)
         old = Path(self.library['root'])
         state = self.service.reset_storage()
         self.assertIsNone(state['library'])
         self.assertEqual(state['storage_warning'], '')
         self.assertTrue(old.is_dir())
         self.assertEqual(self.service.storage_root, self.service.root.resolve())
+        self.assertIn(str(configured), self.service.config['storage_history'])
+
+    def test_storage_refresh_recovers_a_reattached_owned_directory(self):
+        external = self.root/'reattached'
+        self.service.config['storage_dir'] = str(external)
+        self.service.storage_warning = 'Synthetic unavailable disk'
+        self.assertNotEqual(self.service.get_storage_info()['path'], str(external))
+        external.mkdir()
+        (external/'.moect-storage.json').write_text(json.dumps({'owner':self.service.config['storage_id']}))
+        self.assertEqual(self.service.get_storage_info()['path'], str(external))
+        self.assertEqual(self.service.state()['storage_warning'], '')
+
+    def test_storage_change_during_export_preparation_does_not_queue_old_paths(self):
+        def measure_source(library):
+            self.execute('storage_migrate', self.root/'relocated')
+            return 0
+        with patch('core.service.storage.source_database_bytes', side_effect=measure_source):
+            with self.assertRaisesRegex(ValueError,'缓存位置已更改'):
+                self.service.export({'sessions':[SESSION],'format':'html'})
+        self.assertFalse(any(task['kind']=='export' for task in self.service.config['tasks']))
+        self.assertTrue(Path(self.service.library['root']).is_dir())
 
     def test_diagnostic_report_omits_titles_paths_messages_keys_and_passwords(self):
         self.service.config['tasks'] = [dict(kind='connect', status='failed', progress=45, title='private name',

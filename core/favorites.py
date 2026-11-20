@@ -11,6 +11,8 @@ import re
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from contextlib import closing
+from itertools import islice
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -23,6 +25,7 @@ from .paths import is_link
 from .inline_faces import ArchiveFaces
 from .game_emojis import game_image
 from wx4.game_emojis import from_hash
+from wx4.media import SIG_V1, SIG_V2
 
 TYPES = {1:'文本',2:'图片',3:'语音',4:'视频',5:'链接 / 文章',6:'位置',7:'音乐',8:'文件',
          14:'聊天记录',16:'商品',18:'笔记',19:'小程序',20:'视频号',37:'表情'}
@@ -121,49 +124,74 @@ class FavoriteCatalog:
     def __init__(self, library, name_of=lambda uid:uid):
         self.library,self.name_of = library,name_of
 
+    def _rows(self, con, options, cancel=lambda:None, *, ids_only=False):
+        if 'fav_db_item' not in tables(con):
+            raise ValueError('当前收藏库结构暂不受支持，请重新连接微信或更新适配。')
+        where,args = ['COALESCE(flag,0)=0'],[]
+        for field,op in (('_start','>='),('_end','<=')):
+            if options.get(field) is not None:where.append('update_time '+op+' ?');args.append(options[field])
+        typ = text(options.get('favoriteType','all'))
+        if typ != 'all':
+            if not typ.isdigit():raise ValueError('收藏类型无效')
+            where.append('(type & 4294967295)=?');args.append(int(typ))
+        wanted = options.get('ids')
+        excluded = options.get('exclude_ids',[])
+        if wanted is not None and (not isinstance(wanted,list) or not all(isinstance(v,str) and v.isdigit() for v in wanted)):
+            raise ValueError('收藏选择无效')
+        if not isinstance(excluded,list) or not all(isinstance(v,str) and v.isdigit() for v in excluded):raise ValueError('收藏选择无效')
+        wanted = set(wanted) if wanted is not None else None
+        excluded = set(excluded)
+        if wanted is not None and not wanted:
+            return
+        if wanted and len(wanted)<=400:
+            where.append('local_id IN ('+','.join('?' for _ in wanted)+')')
+            args.extend(wanted)
+        columns = 'local_id' if ids_only else 'local_id,type,update_time,content,fromusr,realchatname'
+        sql = 'SELECT '+columns+' FROM fav_db_item WHERE '+' AND '.join(where)
+        if not ids_only:
+            sql += ' ORDER BY update_time DESC,local_id DESC'
+        with closing(con.execute(sql,args)) as rows:
+            for row in rows:
+                cancel();identity=str(row['local_id'])
+                if identity in excluded or wanted is not None and identity not in wanted:continue
+                yield row
+
+    def count(self, options, cancel):
+        con = open_asset_db(self.library,'favorite/favorite.db')
+        if con is None:return 0
+        with closing(con):
+            return sum(1 for _ in self._rows(con,options,cancel,ids_only=True))
+
+    def _matching_items(self, rows, query):
+        for row in rows:
+            item = parse_favorite(row,self.name_of)
+            if not query or query in json.dumps(clean(item),ensure_ascii=False).casefold():
+                yield item
+
     def items(self, options=None, cancel=lambda:None):
         options = options or {}
         con = open_asset_db(self.library,'favorite/favorite.db')
         if con is None:return
-        try:
-            if 'fav_db_item' not in tables(con):
-                raise ValueError('当前收藏库结构暂不受支持，请重新连接微信或更新适配。')
-            where,args = ['COALESCE(flag,0)=0'],[]
-            for field,op in (('_start','>='),('_end','<=')):
-                if options.get(field) is not None:where.append('update_time '+op+' ?');args.append(options[field])
-            typ = text(options.get('favoriteType','all'))
-            if typ != 'all':
-                if not typ.isdigit():raise ValueError('收藏类型无效')
-                where.append('(type & 4294967295)=?');args.append(int(typ))
-            query = text(options.get('query')).strip().casefold()
-            wanted = options.get('ids')
-            excluded = options.get('exclude_ids',[])
-            if wanted is not None and (not isinstance(wanted,list) or not all(isinstance(v,str) and v.isdigit() for v in wanted)):
-                raise ValueError('收藏选择无效')
-            if not isinstance(excluded,list) or not all(isinstance(v,str) and v.isdigit() for v in excluded):raise ValueError('收藏选择无效')
-            wanted = set(wanted) if wanted is not None else None
-            excluded = set(excluded)
-            rows = con.execute('SELECT local_id,type,update_time,content,fromusr,realchatname FROM fav_db_item WHERE '+
-                               ' AND '.join(where)+' ORDER BY update_time DESC,local_id DESC',args)
-            for row in rows:
-                cancel();identity=str(row['local_id'])
-                if identity in excluded or wanted is not None and identity not in wanted:continue
-                item = parse_favorite(row,self.name_of)
-                if query and query not in json.dumps(clean(item),ensure_ascii=False).casefold():continue
-                yield item
-        finally:con.close()
+        with closing(con), closing(self._rows(con,options,cancel)) as rows:
+            yield from self._matching_items(rows,text(options.get('query')).strip().casefold())
 
     def summary(self, options=None):
-        options=options or {};offset=max(0,integer(options.get('offset')));limit=80;items=[];count=0
+        options=options or {};offset=max(0,integer(options.get('offset')));limit=80;selected=[]
         con=open_asset_db(self.library,'favorite/favorite.db')
         if con is None:return {'available':False,'notice':'尚无收藏快照。先在电脑微信打开“收藏”，再重新连接并整理微信。','items':[],'count':0}
-        con.close()
-        for item in self.items(options):
-            if offset<=count<offset+limit:
-                summary={k:v for k,v in clean(item).items() if k!='blocks'}
-                summary['text']=summary['text'][:600]
-                items.append(summary)
-            count+=1
+        query=text(options.get('query')).strip().casefold()
+        with closing(con), closing(self._rows(con,options)) as rows:
+            if query:
+                count=0
+                for item in self._matching_items(rows,query):
+                    if offset<=count<offset+limit:selected.append(item)
+                    count+=1
+            else:
+                count=sum(1 for _ in self._rows(con,options,ids_only=True))
+                selected=list(self._matching_items(islice(rows,offset,offset+limit),''))
+        items=[clean({key:value for key,value in item.items() if key!='blocks'}) for item in selected]
+        for item in items:
+            item['text']=item['text'][:600]
         return {'available':True,'notice':NOTICE,'items':items,'count':count,'offset':offset,'limit':limit,
                 'types':[{'id':str(k),'name':v} for k,v in TYPES.items()]}
 
@@ -174,7 +202,7 @@ class FavoriteResources:
         self.store,self.library=store,library
         self.deadline=time.monotonic()+seconds if seconds is not None else None
         self.indexed=False
-        store.index.execute('CREATE TABLE favorite_files (md5 TEXT,path TEXT,role TEXT)')
+        store.index.execute('CREATE TABLE favorite_files (md5 TEXT,path TEXT,role TEXT,needs_verification INTEGER)')
         store.index.execute('CREATE INDEX favorite_md5 ON favorite_files(md5)')
         # Recovery is an explicit shared UI action, never repeated per cache file.
         store.keys.scan_remaining=0
@@ -201,32 +229,54 @@ class FavoriteResources:
             store.cancel()
             if self.deadline is not None and time.monotonic()>self.deadline:break
             try:
-                if path.stat().st_size>128*1024*1024:
+                source = path
+                large = path.stat().st_size>128*1024*1024
+                if large:
                     if self.deadline is not None:continue
-                    # Hash/copy ordinary large attachments in chunks. Never
-                    # load a large video or document into Python memory.
-                    digest=hashlib.md5();source=Path(store.tmp.name)/('large-'+hashlib.sha256(str(path).encode()).hexdigest())
-                    with path.open('rb') as src,source.open('wb') as dst:
+                    digest=hashlib.md5()
+                    with path.open('rb') as src:
                         head=src.read(6)
-                        if head.startswith((b'\x07\x08V1',b'\x07\x08V2')):continue
-                        digest.update(head);dst.write(head)
-                        while True:
-                            store.cancel();chunk=src.read(1024*1024)
-                            if not chunk:break
-                            digest.update(chunk);dst.write(chunk)
-                    store.index.execute('INSERT INTO favorite_files VALUES (?,?,?)',(digest.hexdigest(),str(source),'main'))
-                    continue
-                raw=path.read_bytes();decoded=store.keys.decode(raw,path,samples)
-                # Non-image favorite files may already be ordinary plaintext.
-                if decoded is None:
-                    if raw.startswith((b'\x07\x08V1',b'\x07\x08V2')):continue
-                    decoded=raw
-                digest=hashlib.md5(decoded).hexdigest()
-                source=Path(store.tmp.name)/('favorite-'+hashlib.sha256(str(path).encode()).hexdigest())
-                source.write_bytes(decoded)
-                store.index.execute('INSERT INTO favorite_files VALUES (?,?,?)',(digest,str(source),'thumbnail' if bucket in ('thumb','mid') else 'main'))
+                        if head.startswith((SIG_V1,SIG_V2)):continue
+                        digest.update(head)
+                        while chunk := src.read(1024*1024):
+                            store.cancel();digest.update(chunk)
+                else:
+                    raw=path.read_bytes();decoded=store.keys.decode(raw,path,samples)
+                    if decoded is None:
+                        if raw.startswith((SIG_V1,SIG_V2)):continue
+                        decoded=raw
+                    digest=hashlib.md5(decoded)
+                    if decoded is not raw:
+                        source=Path(store.tmp.name)/('favorite-'+hashlib.sha256(str(path).encode()).hexdigest())
+                        source.write_bytes(decoded)
+                role = 'thumbnail' if not large and bucket in ('thumb','mid') else 'main'
+                store.index.execute('INSERT INTO favorite_files VALUES (?,?,?,?)',
+                                    (digest.hexdigest(),str(source),role,source==path))
             except (OSError,ValueError):continue
         store.index.commit()
+
+    def verified_source(self, path, digest):
+        """Take a stable copy only after an attachment was selected by its content hash."""
+        store = self.store
+        target = Path(store.tmp.name)/('verified-'+digest)
+        if target.is_file():
+            return target
+        partial = target.with_suffix('.part')
+        check = hashlib.md5()
+        try:
+            if is_link(path) or path.resolve() != path:
+                return None
+            with path.open('rb') as original, partial.open('wb') as output:
+                while chunk := original.read(1024*1024):
+                    store.cancel()
+                    check.update(chunk)
+                    output.write(chunk)
+            if check.hexdigest() == digest:
+                partial.replace(target)
+                return target
+        finally:
+            partial.unlink(missing_ok=True)
+        return None
 
     def resolve(self, block):
         store=self.store;kind=block['kind'];hints=block['_media']
@@ -237,13 +287,20 @@ class FavoriteResources:
             if image:
                 block['resources'].append(store._copy('wechat-game:'+game['md5'],'image',image,'.png'))
                 return
-        self.index();candidates=[]
+        candidates=[]
         for field,role in (('fullmd5','main'),('thumbfullmd5','thumbnail')):
             digest=hints[field].lower()
             if not MD5.fullmatch(digest):continue
-            for path,stored_role in store.index.execute('SELECT path,role FROM favorite_files WHERE md5=? ORDER BY role', (digest,)):
+            self.index()
+            for path,stored_role,needs_verification in store.index.execute(
+                    'SELECT path,role,needs_verification FROM favorite_files WHERE md5=? ORDER BY role', (digest,)):
                 if role=='main' and stored_role!='main':continue
-                candidates.append((Path(path),role,digest))
+                try:
+                    source = self.verified_source(Path(path), digest) if needs_verification else Path(path)
+                except OSError:
+                    continue
+                if source:
+                    candidates.append((source,role,digest))
         if kind=='voice' and not candidates:
             # Original message IDs are globally unique within this account.
             for blob in self.voice_candidates(block):
@@ -341,10 +398,12 @@ def export_favorites(archive,library,payload,folder,assets,progress,cancel,statu
     articles=payload.get('articles',True)
     if not isinstance(articles,bool):raise ValueError('文章下载选项无效')
     catalog=FavoriteCatalog(library,archive.data.name_of)
-    # Count by streaming; do not retain a second copy of large record XML trees.
-    total=sum(1 for _ in catalog.items(payload,cancel))
-    if not total:raise ValueError('所选范围没有可导出的收藏，请刷新后重新选择。')
-    data=metadata(archive.profile()['name']+' · 收藏','favorites',archive.profile())
+    searching=bool(text(payload.get('query')).strip())
+    total=0 if searching else catalog.count(payload,cancel)
+    if not total and not searching:
+        raise ValueError('所选范围没有可导出的收藏，请刷新后重新选择。')
+    profile=archive.profile()
+    data=metadata(profile['name']+' · 收藏','favorites',profile)
     data.update(items=[],theme=archive_theme(payload.get('_theme')),notice=NOTICE)
     store=ResourceStore(archive.data,'',folder,cancel,status,{'includeAvatars':False})
     resolver=FavoriteResources(store,library)
@@ -352,8 +411,9 @@ def export_favorites(archive,library,payload,folder,assets,progress,cancel,statu
     md=folder/'Markdown';md.mkdir()
     try:
         article_at=0
-        for n,item in enumerate(catalog.items(payload,cancel),1):
-            progress(n,total)
+        count=0
+        for count,item in enumerate(catalog.items(payload,cancel),1):
+            progress(count,total)
             def resolve(block):
                 resolver.resolve(block)
                 for child in block.get('children',[]):resolve(child)
@@ -391,6 +451,8 @@ def export_favorites(archive,library,payload,folder,assets,progress,cancel,statu
         data['resource_summary']=dict(store.stats)
     finally:store.close()
     cancel()
+    if not count:raise ValueError('所选范围没有可导出的收藏，请刷新后重新选择。')
+    progress(count,count)
     faces.write(folder)
     (folder/'data.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
     encoded=json.dumps(data,ensure_ascii=False).replace('<','\\u003c').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
@@ -398,4 +460,4 @@ def export_favorites(archive,library,payload,folder,assets,progress,cancel,statu
     for key,file in (('__DATE_RANGE_PICKER__','date-range-picker.js'),('__ARCHIVE_MEDIA__','archive-media.js'),('__ARCHIVE_PRINT__','archive-print.js'),('__INLINE_FACES__','inline-faces.js')):
         template=template.replace(key,(assets/file).read_text('utf-8'))
     (folder/'index.html').write_text(template.replace('__FAVORITES__',encoded),encoding='utf-8')
-    return {'name':data['name'],'path':str(folder/'index.html'),'count':total,'format':'favorites','resource_summary':data['resource_summary']}
+    return {'name':data['name'],'path':str(folder/'index.html'),'count':count,'format':'favorites','resource_summary':data['resource_summary']}

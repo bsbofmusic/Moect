@@ -48,7 +48,7 @@ class AudioTests(unittest.TestCase):
     def test_truncated_or_excessive_silk_is_rejected_before_native_decode(self):
         blob=silk_fixture()
         invalid=(blob[:-1],b'\x02#!SILK_V3\xff\x7f',b'\x02#!SILK_V3'+b'\0\0'*30001,
-                 blob+b'\0\0',blob+b'\x00',blob+b'\xfe\xff',
+                 blob+b'\0\0'+blob[10:],blob+b'\0'*258,blob+b'\x00',blob+b'\xfe\xff',
                  b'\x02#!SILK_V3'+struct.pack('<h',1251)+b'x'*1251)
         with patch('pysilk.decode',side_effect=AssertionError('Invalid packets reached native decoder')):
             for source in invalid:
@@ -61,7 +61,7 @@ class AudioTests(unittest.TestCase):
             for duration in (20, 40, 200):
                 blob = silk_fixture(duration, rate)
                 standard = blob[1:]
-                variants = (blob, standard, standard + b'\xff\xff',
+                variants = (blob, standard, standard + b'\xff\xff', blob + b'\0' * 12,
                             blob[:10] + b'\n' + blob[10:],
                             standard[:9] + b'\r\n' + standard[9:] + b'\xff\xff')
                 for number, source in enumerate(variants):
@@ -85,6 +85,16 @@ class AudioTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(self.codec.audio(blob, target), target)
         self.assertEqual(self.codec.audio_reason, '')
+
+    def test_old_silk_zero_padding_is_independent_of_clip_duration_and_filename(self):
+        for padding in (2, 6, 12, 38, 128, 256):
+            for duration in (20, 120, 520):
+                blob = silk_fixture(duration, sample_rate=16000)
+                with self.subTest(padding=padding, duration=duration):
+                    target = self.root/'clip.wav'
+                    self.assertEqual(self.codec.audio(blob + b'\0' * padding, target), target)
+                    with wave.open(str(target), 'rb') as audio:
+                        self.assertEqual(audio.getnframes(), 24 * duration)
 
     def test_export_and_forward_voice_are_wav_and_failed_conversion_is_reported(self):
         lib=media_fixture(self.root)

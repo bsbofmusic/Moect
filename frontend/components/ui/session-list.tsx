@@ -117,6 +117,8 @@ export interface SessionListProps {
    */
   onSelectMany?: (ids: Set<string>, mode: 'add' | 'remove') => void
   onOpenBatchExportDialog?: () => void
+  canRestoreLastExport?: boolean
+  onRestoreLastExport?: () => Promise<boolean>
   onPreviewChat?: (type: 'group' | 'friend', id: string, name: string, peer: { chatType: number, peerUid: string }) => void
   onOpenTaskWizard?: (
     preset: Pick<CreateTaskForm, "chatType" | "peerUid" | "sessionName"> &
@@ -140,6 +142,8 @@ function SessionListComponent({
   onToggleItem,
   onSelectMany,
   onOpenBatchExportDialog,
+  canRestoreLastExport,
+  onRestoreLastExport,
   onPreviewChat,
   onOpenTaskWizard,
 }: SessionListProps) {
@@ -177,6 +181,14 @@ function SessionListComponent({
   const searchInputRef = useRef<HTMLInputElement>(null)
   // Issue #344: 记住上一次点击的 row key，用于 shift+click 区间多选。
   const lastClickedKeyRef = useRef<string | null>(null)
+
+  const restoreLastExport = async () => {
+    if (await onRestoreLastExport?.()) {
+      lastClickedKeyRef.current = null
+      setSearch('')
+      setType('all')
+    }
+  }
 
   const handleToggleSort = useCallback(() => {
     setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
@@ -436,6 +448,11 @@ function SessionListComponent({
           <PillDropdown
             value={sortField}
             onChange={(v) => setSortField(v as SortField)}
+            leadingAction={{
+              label: "上一次导出",
+              disabled: !canRestoreLastExport,
+              onSelect: () => void restoreLastExport(),
+            }}
             options={[
               { value: "frequentExport", label: "常用导出" },
               { value: "name", label: "名称" },

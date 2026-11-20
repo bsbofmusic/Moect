@@ -70,6 +70,47 @@ class StorageLimitTests(unittest.TestCase):
         self.assertTrue(live.is_file());self.assertEqual(job['freed_bytes'],0)
         self.assertIn('未强制删除',job['detail'])
 
+    def test_storage_totals_exclude_exports_and_report_partial_disk_reads(self):
+        self.file('previews/exports/important.html',size=900)
+        self.file('archives/account/moments-thumbnails/old.jpg',size=31)
+        self.file('media-cache/account/downloads/internal.media',size=70)
+        self.assertEqual(self.service.get_storage_info()['bytes'],101)
+        scandir = os.scandir
+        def unreadable(path):
+            if Path(path)==self.root/'media-cache':
+                raise PermissionError('Synthetic inaccessible category')
+            return scandir(path)
+        with patch('core.storage.os.scandir', side_effect=unreadable):
+            info=self.service.get_storage_info()
+        self.assertTrue(info['incomplete'])
+        self.assertEqual(info['bytes'],31)
+        self.assertTrue(info['roots'][0]['current'])
+
+    def test_clear_skips_open_file_and_cleans_moments_thumbnails_and_other_entries(self):
+        locked = self.file('media-cache/account/downloads/locked.media',size=10,age=1)
+        thumb = self.file('archives/account/moments-thumbnails/old.jpg',size=31,age=2)
+        removable = self.file('media-cache/account/downloads/removable.media',size=9,age=3)
+        export = self.file('previews/exports/kept.html',size=900,age=4)
+        unlink = Path.unlink
+        def blocked(path, *args, **kwargs):
+            if path == locked:
+                raise PermissionError('Synthetic sharing violation')
+            return unlink(path, *args, **kwargs)
+        job = self.service._new_job('storage_cleanup','Synthetic cleanup')
+        with patch.object(Path,'unlink',blocked):
+            storage.cleanup(self.service,job)
+        self.assertEqual(job['freed_bytes'],40)
+        self.assertEqual(job['skipped_entries'],1)
+        self.assertTrue(locked.exists() and export.exists())
+        self.assertFalse(thumb.exists() or removable.exists())
+
+    def test_changing_the_limit_before_delayed_start_waits_until_next_launch(self):
+        self.service._startup_storage_limit=1
+        self.service.config['storage_limit_gb']=5
+        with patch.object(self.service.pool,'submit') as submit:
+            self.service._queue_storage_check()
+            submit.assert_not_called()
+
     def test_busy_startup_defers_then_submits_once_and_below_cap_has_no_task(self):
         self.service._startup_storage_limit = self.service.config['storage_limit_gb'] = 1
         self.service._cache_readers = 1

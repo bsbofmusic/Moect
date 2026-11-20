@@ -295,13 +295,18 @@ def moment_from_row(row,owner=None):
     return result
 
 
+def moment_preview(post, name_of):
+    return {**{key:post.get(key) for key in ('id','author','text','title','create_time','status')},
+            'author_name':name_of(post['author']) or post['author']}
+
+
 class MomentsCatalog:
     def __init__(self,library,owner,scope='self',author_id=''):
         if scope not in ('self','timeline','account'):raise ValueError('朋友圈导出范围无效')
         self.library=library;self.owner=owner;self.scope=scope;self.author_id=author_id
-        self.available=False;self.unparsed=0
+        self.available=False
 
-    def posts(self,cancel=lambda:None):
+    def posts(self,cancel=lambda:None, *, start=None, end=None):
         con=open_asset_db(self.library,'sns/sns.db')
         if con is None:return
         try:
@@ -316,9 +321,9 @@ class MomentsCatalog:
             if target is not None:query+=' WHERE user_name=?'
             for row in con.execute(query+' ORDER BY tid DESC',(target,) if target is not None else ()):
                 cancel();post=moment_from_row(row,target)
-                if post:
-                    if post['status']!='available':self.unparsed+=1
-                    yield post
+                if post is None:continue
+                if (start is not None and post['create_time']<start) or (end is not None and post['create_time']>end):continue
+                yield post
         except sqlite3.Error:raise ValueError('朋友圈数据库无法读取，请重新整理微信后重试。') from None
         finally:con.close()
 
@@ -332,13 +337,13 @@ class MomentsCatalog:
         except sqlite3.Error:raise ValueError('朋友圈账号列表无法读取，请刷新资源快照。') from None
         finally:con.close()
 
-    def summary(self,start=None,end=None,name_of=lambda uid:uid):
+    def summary(self,start=None,end=None,name_of=lambda uid:uid, *, render_previews=None):
         previews=[];count=0;unparsed=0
-        for post in self.posts():
-            if start is not None and post['create_time']<start or end is not None and post['create_time']>end:continue
+        for post in self.posts(start=start,end=end):
             count+=1
             if post['status']!='available':unparsed+=1
-            if len(previews)<12:previews.append({**{k:post.get(k) for k in ('id','author','text','title','create_time','status')},'author_name':name_of(post['author']) or post['author']})
+            if len(previews)<12:previews.append(post)
+        previews = render_previews(previews) if render_previews else [moment_preview(post,name_of) for post in previews]
         return {'available':self.available,'count':count,'unparsed':unparsed,'posts':previews,'scope':self.scope,
                 'authors':self.authors(name_of),
                 'notice':'读取本地已缓存的朋友圈。手动在微信浏览新内容后，点击刷新资源快照即可更新。'}

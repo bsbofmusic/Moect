@@ -2,7 +2,6 @@
 import csv
 import hashlib
 import html
-import io
 import json
 import re
 from contextlib import closing, nullcontext
@@ -33,17 +32,18 @@ def export_folder_name(name,uid,now=None):
     return safe_name(str(name))[:36]+'_'+safe_name(str(uid))[:42]+'_'+stamp
 
 
-def unused_folder(parent,name):
-    candidate=parent/name;number=2
+def unused_folder(parent,name,suffix=''):
+    candidate=parent/(name+suffix);number=2
     while candidate.exists():
-        candidate=parent/(name+'_'+str(number));number+=1
+        candidate=parent/(name+'_'+str(number)+suffix);number+=1
     return candidate
 
 
 def clean(msg):
-    if isinstance(msg,list):return [clean(value) for value in msg]
     if isinstance(msg,dict):
-        return {k:clean(v) for k,v in msg.items() if not k.startswith('_') and k not in ('packed_hex','content')}
+        return {k:clean(v) if isinstance(v, (dict, list)) else v
+                for k,v in msg.items() if not k.startswith('_') and k not in ('packed_hex','content')}
+    if isinstance(msg,list):return [clean(value) for value in msg]
     return msg
 
 
@@ -85,6 +85,35 @@ def csv_cell(value):
     return "'" + value if value.lstrip().startswith(('=', '+', '-', '@')) else value
 
 
+def write_html_chunks(folder, filename_prefix, records, progress=lambda _: None):
+    chunks, parts, stamps = [], [], []
+    size = count = 0
+
+    def flush():
+        filename = filename_prefix + '%06d.js' % (len(chunks)+1)
+        with BufferedTextWriter(folder/filename) as writer:
+            writer.write('window.__wxChunk=['+', '.join(parts)+'];')
+        chunks.append(dict(file=filename,count=len(parts),start_time=min(stamps),end_time=max(stamps)))
+        parts.clear()
+        stamps.clear()
+
+    for record in records:
+        encoded = json.dumps(record, ensure_ascii=False)
+        length = len(encoded.encode('utf-8'))
+        if parts and (size+length>4*1024*1024 or len(parts)>=500):
+            flush()
+            size = 0
+        parts.append(encoded)
+        stamps.append(int(record.get('create_time') or 0))
+        size += length
+        count += 1
+        if count % 200 == 0:
+            progress(count)
+    if parts:
+        flush()
+    return chunks, count
+
+
 def materialize_forward(msg,folder,template,exported_at,cancel):
     """Write independent offline forward pages, plus complete JSON/TXT copies.
 
@@ -111,20 +140,11 @@ def materialize_forward(msg,folder,template,exported_at,cancel):
                 cancel();writer.write('['+child.get('time_str','')+'] '+child.get('sender','')+'\n'+readable_text(child)+'\n\n')
             if forward.get('notice'):writer.write(forward['notice'])
         for child in messages:materialize_forward(child,folder,template,exported_at,cancel)
-        chunks=[];batch=[];batch_bytes=0
-        def flush():
-            if not batch:return
-            filename=stem+'_c%06d.js'%(len(chunks)+1)
-            with BufferedTextWriter(folder/filename) as writer:
-                writer.write('window.__wxChunk='+json.dumps(batch,ensure_ascii=False)+';')
-            stamps=[int(child.get('create_time') or 0) for child in batch]
-            chunks.append({'file':filename,'count':len(batch),'start_time':min(stamps),'end_time':max(stamps)})
-            batch.clear()
-        for child in messages:
-            cancel();length=len(json.dumps(child,ensure_ascii=False).encode())
-            if batch and (batch_bytes+length>4*1024*1024 or len(batch)>=500):flush();batch_bytes=0
-            batch.append(child);batch_bytes+=length
-        flush()
+        def forward_records():
+            for child in messages:
+                cancel()
+                yield child
+        chunks, _ = write_html_chunks(folder, stem+'_c', forward_records())
         manifest={**meta,'chunks':chunks,'downloads':{'json':stem+'.json','txt':stem+'.txt'}}
         config=json.dumps(manifest,ensure_ascii=False).replace('<','\\u003c')
         (folder/(stem+'.html')).write_text(template.replace('__MANIFEST__',config),encoding='utf-8')
@@ -133,7 +153,8 @@ def materialize_forward(msg,folder,template,exported_at,cancel):
         html=stem+'.html',json=stem+'.json',txt=stem+'.txt')
 
 
-def export_session(archive, session, options, folder, viewer_assets, progress, cancel, status=None):
+def export_session(archive, session, options, folder, viewer_assets, progress, cancel, status=None,
+                   scan_progress=None, *, batch=False, batch_media=None):
     fmt = options.get('format', 'html')
     if fmt not in FORMATS:
         raise ValueError('不支持的导出格式')
@@ -141,18 +162,25 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
     stem = safe_name(title) + '_' + hashlib.sha256(session['username'].encode()).hexdigest()[:8]
     count = 0
     first_time = last_time = None
-    out = folder / stem if fmt=='html' else folder / (stem+'_assets')
+    out = (folder if batch else folder / stem) if fmt=='html' else folder / (stem+'_assets')
     out.mkdir(exist_ok=True)
     preferences=export_preferences(options)
-    with (closing(ResourceStore(archive.data, session['username'], out, cancel, status, preferences))
+    with (closing(ResourceStore(archive.data, session['username'], out, cancel, status, preferences,
+                                remote_media=preferences['allow_remote_media'], batch_media=batch_media))
           if hasattr(archive, 'data') else nullcontext()) as resources:
         def records():
             nonlocal first_time,last_time
-            for msg in archive.messages(session['username'],options,cancel=cancel):
+            processed = 0
+            def on_scan(scanned):
+                scan_progress(scanned, processed)
+            scan = {'on_scan': on_scan} if scan_progress is not None else {}
+            for msg in archive.messages(session['username'],options,cancel=cancel,**scan):
                 if not preferences['include_system_messages'] and is_system_message(msg):continue
                 first_time=msg['create_time'] if first_time is None else first_time
                 last_time=msg['create_time']
-                yield resources.enrich(msg) if resources else msg
+                message = resources.enrich(msg) if resources else msg
+                processed += 1
+                yield message
         meta = dict(application=APP_NAME, version=VERSION, session=session['username'],
                     theme=archive_theme(options.get('_theme')),
                     name=title, exported_at=datetime.now().isoformat(timespec='seconds'),
@@ -172,27 +200,16 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
         elif fmt == 'html':
             faces = ArchiveFaces(viewer_assets, cancel)
             template = theme_archive((viewer_assets / 'viewer.html').read_text(encoding='utf-8'),meta['theme']).replace('__DATE_RANGE_PICKER__',(viewer_assets/'date-range-picker.js').read_text(encoding='utf-8')).replace('__ARCHIVE_PRINT__',(viewer_assets/'archive-print.js').read_text(encoding='utf-8')).replace('__ARCHIVE_MEDIA__',(viewer_assets/'archive-media.js').read_text(encoding='utf-8')).replace('__INLINE_FACES__',(viewer_assets/'inline-faces.js').read_text(encoding='utf-8'))
-            chunks, batch = [], []
-            batch_bytes = 0
-            def flush():
-                if not batch: return
-                filename = 'c%06d.js' % (len(chunks)+1)
-                with BufferedTextWriter(out / filename) as writer:
-                    writer.write('window.__wxChunk=' + json.dumps(batch, ensure_ascii=False) + ';')
-                stamps=[int(child.get('create_time') or 0) for child in batch]
-                chunks.append(dict(file=filename,count=len(batch),start_time=min(stamps),end_time=max(stamps)))
-                batch.clear()
-            for msg in records():
-                record=clean(msg)
-                faces.remember(record)
-                materialize_forward(record,out,template,meta['exported_at'],cancel)
-                record_bytes=len(json.dumps(record,ensure_ascii=False).encode('utf-8'))
-                if batch and batch_bytes+record_bytes>4*1024*1024:
-                    flush();batch_bytes=0
-                batch.append(record);batch_bytes+=record_bytes;count+=1
-                if len(batch) >= 500:flush();batch_bytes=0
-                if count % 200 == 0: progress(count)
-            flush()
+            if batch:
+                link = '<div id="header-content"><p><a href="../index.html">返回会话目录</a></p>'
+                template = template.replace('<div id="header-content">', link, 1)
+            def html_records():
+                for msg in records():
+                    record=clean(msg)
+                    faces.remember(record)
+                    materialize_forward(record,out,template,meta['exported_at'],cancel)
+                    yield record
+            chunks, count = write_html_chunks(out, 'c', html_records(), progress)
             faces.write(out)
             manifest = dict(**meta, count=count, chunks=chunks,
                             resource_summary=resources.stats if resources else {})
@@ -206,21 +223,22 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                 if fmt=='jsonl': writer.write(json.dumps({'metadata':meta}, ensure_ascii=False)+'\n')
                 if fmt in ('txt','md'):
                     writer.write(('# ' if fmt=='md' else '') + title + '\n' + ('演示数据 · ' if meta['demo'] else '') + '由 '+APP_NAME+' 导出\n\n')
-                if fmt=='csv': writer.write('时间,会话,发送者,类型,内容,消息ID\r\n')
+                if fmt=='csv':
+                    csv_writer = csv.writer(writer)
+                    csv_writer.writerow(['时间','会话','发送者','类型','内容','消息ID'])
                 for msg in records():
                     # Non-HTML exports keep resources next to the document. JSON
                     # paths are relative to the document, not the assets directory.
                     prefix=out.name+'/'
                     portable_paths(msg,prefix)
-                    text=readable_text(msg,fmt=='md')
                     if fmt=='json':
                         writer.write((',' if count else '') + json.dumps(clean(msg), ensure_ascii=False))
                     elif fmt=='jsonl': writer.write(json.dumps(clean(msg), ensure_ascii=False)+'\n')
                     elif fmt=='csv':
-                        buffer=io.StringIO(newline=''); row=csv.writer(buffer)
-                        row.writerow([csv_cell(v) for v in [msg['time_str'], title, msg['sender'], msg['type_name'], text, msg['server_id']]])
-                        writer.write(buffer.getvalue())
+                        csv_writer.writerow([csv_cell(v) for v in [msg['time_str'], title, msg['sender'], msg['type_name'],
+                                                                   readable_text(msg), msg['server_id']]])
                     else:
+                        text=readable_text(msg,fmt=='md')
                         writer.write(f"[{msg['time_str']}] {msg['sender']}\n{text}\n\n")
                     count += 1
                     if count % 200 == 0: progress(count)
@@ -232,9 +250,9 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                     resource_summary=resources.stats if resources else {})
 
 
-def export_index(folder, records, demo=False,theme=None):
+def export_index(folder, records, demo=False,theme=None, *, directory=False, failures=()):
     # Open HTML archives in the viewer; batch navigation stays inside it.
-    if records and all(r['format']=='html' for r in records):
+    if not directory and records and all(r['format']=='html' for r in records):
         paths=[Path(r['path']).relative_to(folder).as_posix() for r in records]
         if len(records)>1:
             for record,current in zip(records,paths):
@@ -266,4 +284,7 @@ def export_index(folder, records, demo=False,theme=None):
                      html.escape(r['name']), r['count'], r['format'].upper()) for r in records)
     content = '<!doctype html><meta charset="utf-8"><title>聊天记录归档</title><style>body{font:15px system-ui;max-width:850px;margin:70px auto;background:#f7f5fb;color:#292137}h1{font-size:32px}li{display:flex;justify-content:space-between;padding:20px;background:white;margin:10px 0;border-radius:12px}a{color:#7056c4;text-decoration:none}span{color:#7e718f}</style>'
     content += '<h1>聊天记录归档' + (' · 演示数据' if demo else '') + '</h1><p>'+APP_NAME+' · 本地归档</p><ul>' + links + '</ul>'
+    if failures:
+        content += '<h2>未能导出的会话</h2><ul>' + ''.join(
+            '<li>'+html.escape(name)+'</li>' for name in failures) + '</ul>'
     (folder/'index.html').write_text(theme_archive(content,theme), encoding='utf-8')

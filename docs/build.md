@@ -10,7 +10,6 @@ python -m venv .venv
 pip install -r requirements.txt
 npm ci --prefix frontend
 npm run build --prefix frontend
-Copy-Item ui/icon.svg ui-qce/icon.svg
 python build.py
 .\installer\build.ps1 -OutputDirectory .\release
 python scripts/package_release.py .\release --no-source
@@ -18,7 +17,7 @@ python scripts/package_release.py .\release --no-source
 
 `build.py` 从 `core/version.py` 读取版本，生成 `dist/Moect/Moect.exe`、完整依赖目录、独立更新组件及受管理文件清单。安装脚本读取 EXE 版本并生成 `Moect-版本号-Setup-x64.exe`；打包脚本生成便携 ZIP 与校验文件。便携包不附带使用说明和修复说明，保留运行依赖及许可证。
 
-程序入口是 `edge_app.py`，前端构建至 `ui-qce`。`app.py` 为保留的旧 Qt 宿主，不进入当前桌面发行包。修改前端后重新构建并恢复图标，再进行 Python 打包。
+程序入口是 `edge_app.py`，前端和图标一并构建至 `ui-qce`。`app.py` 为保留的旧 Qt 宿主，不进入当前桌面发行包。修改前端后重新构建，再进行 Python 打包。
 
 安装器允许选择安装位置与桌面快捷方式，使用当前用户权限。首次构建从 Microsoft 官方地址获取 WebView2 引导程序并校验其 Microsoft Authenticode 签名；用户安装时仅在缺少运行环境的情况下执行。Inno Setup 中文翻译保留原维护者信息。
 

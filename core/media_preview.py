@@ -9,11 +9,12 @@ from PIL import Image
 from .data import FIELDS
 from .resources import ResourceStore
 from .avatars import image_type
+from .media_codec import is_flac_message
 
 
 def preview(archive, library, payload, destination, cancel):
     session = payload.get('session')
-    if session not in {row['username'] for row in archive.sessions()}:
+    if not archive.has_session(session):
         raise ValueError('会话不存在。')
     shard, local_id = payload.get('shard'), payload.get('local_id')
     if not isinstance(shard, int) or not 0 <= shard < len(archive.data.msg_dbs) or not isinstance(local_id, int):
@@ -28,7 +29,8 @@ def preview(archive, library, payload, destination, cancel):
     if row is None or str(row['server_id'] or '') != str(payload.get('server_id') or ''):
         raise ValueError('消息已变化，请刷新预览。')
     message = archive.data._build_msg(row, archive.data._name2id(connection), session, shard)
-    if message['kind'] not in ('image', 'emoji', 'voice'):
+    flac = is_flac_message(message)
+    if message['kind'] not in ('image', 'emoji', 'voice') and not flac:
         raise ValueError('此类消息没有可预览媒体。')
     cache_key=[library['root'],session,shard,local_id,str(message['server_id'])]
     game=message.get('extra',{}).get('game_emoji')
@@ -49,13 +51,21 @@ def preview(archive, library, payload, destination, cancel):
     if not result:
         store = ResourceStore(archive.data, session, folder, cancel, options={'includeAvatars': False}, preview=True)
         try:
+            store.preview_flac = flac
             if retry and message['kind'] in ('image', 'emoji'):
                 store.retry = True
                 store.keys.scan_remaining = 8
             enriched = store.enrich(message)
         finally:
             store.close()
-        candidates = [item for item in enriched.get('resources', []) if item['status'] == 'available' and item['kind'] in ('image', 'audio')]
+        candidates = []
+        for item in enriched.get('resources', []):
+            if item['status'] != 'available':
+                continue
+            if item['kind'] in ('image', 'audio'):
+                candidates.append(item)
+            elif flac and item.get('playback') == 'audio':
+                candidates.append({**item, 'kind': 'audio', 'mime': 'audio/flac'})
         candidates.sort(key=lambda item: item.get('role') != 'main')
         if not candidates:
             notice = enriched.get('resource_notice') or '本机尚无可预览资源，请在微信打开后刷新，或导出查看。'
@@ -69,7 +79,7 @@ def preview(archive, library, payload, destination, cancel):
         cache.unlink(missing_ok=True)
         return {'notice': '预览缓存已清理，请重试。'}
     cancel()
-    if path.stat().st_size > 32 * 1024 * 1024:
+    if path.stat().st_size > (8 if result['kind'] == 'audio' else 32) * 1024**2:
         return {'notice': '该资源较大，请导出后查看。'}
     blob = path.read_bytes()
     notice = ''
@@ -89,7 +99,7 @@ def preview(archive, library, payload, destination, cancel):
                 if animated:
                     notice = '动画较大，预览显示首帧。'
     else:
-        mime = 'audio/wav'
+        mime = 'audio/flac' if result.get('mime') == 'audio/flac' else 'audio/wav'
     if len(blob) > 8 * 1024 * 1024:
         return {'notice': '该资源较大，请导出后查看。'}
     return {'url': 'data:' + mime + ';base64,' + base64.b64encode(blob).decode('ascii'),

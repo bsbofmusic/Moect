@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from Cryptodome.Cipher import AES
 from Cryptodome.Util.Padding import pad
+from core.account_assets import MomentsCatalog
 from core.account_exporting import export_moments,local_moments_previews
 from core.data import Archive
 from core.service import Service
@@ -49,7 +50,7 @@ class SnsCacheIdentityTests(unittest.TestCase):
     def test_split_identity_cached_thumbnail_is_used_for_preview_and_export_without_network(self):
         self.prepare()
         with patch('core.resources.ResourceStore._download',side_effect=AssertionError('No SNS downloads')):
-            previews=local_moments_previews(self.archive,self.library,{'scope':'self','author_id':USER})
+            previews=local_moments_previews(self.archive,self.library,list(MomentsCatalog(self.library,USER).posts()))
             self.assertEqual(len(next(p for p in previews if p['id']!='103')['thumbnails']),1)
             destination,post=self.export()
         resource=post['resources'][0]
@@ -65,7 +66,7 @@ class SnsCacheIdentityTests(unittest.TestCase):
         cache=self.root/'private/media-cache'/identity/'image-keys.json';cache.parent.mkdir(parents=True)
         cache.write_text(json.dumps({'keys':[key.hex()]}))
         with patch('core.resources.ResourceStore._download',side_effect=AssertionError('No SNS downloads')):
-            previews=local_moments_previews(self.archive,self.library,{'scope':'self','author_id':USER})
+            previews=local_moments_previews(self.archive,self.library,list(MomentsCatalog(self.library,USER).posts()))
             destination,post=self.export()
         self.assertEqual(len(next(p for p in previews if p['id']!='103')['thumbnails']),1)
         self.assertEqual((destination/post['resources'][0]['path']).read_bytes(),PNG)

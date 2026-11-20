@@ -1,6 +1,7 @@
 """Built 1.2.5 interface and offline media controls with entirely synthetic data."""
 import base64
 import functools
+import hashlib
 import http.server
 import json
 import io
@@ -43,13 +44,14 @@ class Release125UiTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.browser.close();cls.runtime.stop();cls.server.shutdown();cls.server.server_close();cls.thread.join()
 
-    def app(self, invalid_timestamp=False, viewport=None, device_scale_factor=1):
+    def app(self, invalid_timestamp=False, viewport=None, device_scale_factor=1, last_export_sessions=()):
         context = self.browser.new_context(viewport=viewport or {'width':1080, 'height':800},
                                            device_scale_factor=device_scale_factor, reduced_motion='reduce')
         self.addCleanup(context.close)
         page = context.new_page()
         if invalid_timestamp:
             page.add_init_script('window.__invalidTimestamp=true')
+        page.add_init_script('window.__lastExportSessions=' + json.dumps(last_export_sessions))
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
         image = 'data:image/png;base64,' + base64.b64encode(PNG).decode()
@@ -58,7 +60,8 @@ class Release125UiTests(unittest.TestCase):
           const online={configured:false,checking:false,initial_check_done:true,revision:0,error:'',has_update:false,unread_count:0,announcements:[],download:{status:'idle'}};
           const state={version:'1.2.5',theme:'light',accent:'violet',appearance:{},accents:[],export_dir:'Synthetic exports',image_recovery_skip_help:localStorage.getItem('synthetic-recovery-skip')==='true',
             storage_dir:'D:/Synthetic cache',storage_busy:false,storage_warning:'',tasks:[],online,
-            session_sort:{field:'lastActivity',order:'desc'},library:{name:'Synthetic',profile:{name:'Synthetic',wxid:'synthetic'},live:true,demo:false}};
+            session_sort:{field:'lastActivity',order:'desc'},last_export_available:window.__lastExportSessions.length>0,
+            library:{name:'Synthetic',profile:{name:'Synthetic',wxid:'synthetic'},live:true,demo:false}};
           const sessions=[{username:'friend',display:'普通好友',category:'friend'},{username:'gh_sample',display:'示例公众号',category:'official'},
             {username:'filehelper',display:'文件传输助手',category:'other'},{username:'sample@chatroom',display:'合成群',category:'group',is_group:true}]
             .map(row=>({...row,last_time:1800000000,avatar_url:'',summary:''}));
@@ -66,6 +69,7 @@ class Release125UiTests(unittest.TestCase):
           window.pywebview={api:{invoke:async(action,payload={})=>{
             window.__calls.push(action);let result={ok:true};
             if(action==='state')result=state;
+            else if(action==='last_export_sessions')result=window.__lastExportSessions;
             else if(action==='detect')result={running:false,accounts:[{id:'synthetic-account',name:'Synthetic',wxid:'synthetic',connected:true}]};
             else if(action==='sessions')result=sessions;
             else if(action==='settings'){Object.assign(state,payload);if(typeof payload.image_recovery_skip_help==='boolean')localStorage.setItem('synthetic-recovery-skip',String(payload.image_recovery_skip_help));result=state;}
@@ -96,6 +100,22 @@ class Release125UiTests(unittest.TestCase):
         page.wait_for_function('() => window.__ready===true && window.__wce.sessions.length===4')
         return page, errors
 
+    def test_last_export_restores_available_conversations_without_starting_export(self):
+        page, errors = self.app(last_export_sessions=['friend', 'sample@chatroom', 'removed-chat'])
+        page.evaluate("window.__wce.setTab('sessions')")
+        page.get_by_role('button',name='最近活跃',exact=True).click()
+        menu = page.get_by_role('menu')
+        self.assertEqual(menu.get_by_role('menuitem').first.inner_text(), '上一次导出')
+        menu.get_by_role('menuitem',name='上一次导出',exact=True).click()
+        page.get_by_text('已选择 2 项',exact=True).wait_for()
+        self.assertEqual(page.evaluate('window.__payloads.length'),0)
+        page.get_by_role('button',name='最近活跃',exact=True).wait_for()
+        page.get_by_role('button',name='设置并导出',exact=True).click()
+        page.get_by_role('button',name='开始批量导出',exact=True).click()
+        page.wait_for_function('() => window.__payloads.length===1')
+        self.assertEqual(set(page.evaluate('window.__payloads[0].sessions')),{'friend','sample@chatroom'})
+        self.assertEqual(errors,[])
+
     def test_export_waits_for_preferences_before_enabling_start(self):
         page, errors = self.app()
         page.evaluate('''()=>{
@@ -125,6 +145,16 @@ class Release125UiTests(unittest.TestCase):
         slider.wait_for()
         self.assertEqual(slider.input_value(),'5')
         self.assertEqual(slider.get_attribute('aria-valuetext'),'不限制')
+        slider.scroll_into_view_if_needed()
+        idle = slider.screenshot()
+        bounds = slider.bounding_box()
+        page.mouse.move(bounds['x'] + bounds['width'] - 8, bounds['y'] + bounds['height'] / 2)
+        self.assertEqual(slider.screenshot(), idle)
+        page.mouse.down()
+        try:
+            self.assertEqual(slider.screenshot(), idle)
+        finally:
+            page.mouse.up()
         slider.focus();slider.press('Home');slider.press('ArrowRight');slider.press('ArrowRight')
         page.wait_for_function('window.__wce.state.storage_limit_gb===5')
         page.evaluate("window.__wce.setTab('about')")
@@ -166,6 +196,58 @@ class Release125UiTests(unittest.TestCase):
                 self.assertEqual(errors,[])
             finally:
                 context.close()
+
+    def test_exported_flac_plays_inline_and_video_placeholder_is_hidden(self):
+        import sqlite3
+        import subprocess
+        import imageio_ffmpeg
+        from tests.test_resources import media_fixture
+        from core.service import Service
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = media_fixture(root)
+            library['storage_root'] = str(root/'state')
+            flac = root/'account/msg/file/example.flac'
+            subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-loglevel', 'error',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+                            '-c:a', 'flac', str(flac)], check=True)
+            table = 'Msg_' + hashlib.md5(SESSION.encode()).hexdigest()
+            with closing(sqlite3.connect(root/'db/message/message_0.db')) as con, con:
+                con.execute(f'UPDATE "{table}" SET message_content=? WHERE local_id=14',
+                            ('<msg><appmsg><type>6</type><title>example.flac</title></appmsg></msg>',))
+            service = Service(ASSETS, root/'state')
+            try:
+                service.library = library
+                media = service.preview_media({'session': SESSION, 'shard': 0, 'local_id': 14, 'server_id': '14'})
+                self.assertEqual(media['kind'], 'audio')
+                self.assertTrue(media['url'].startswith('data:audio/flac;base64,'))
+                self.assertEqual(base64.b64decode(media['url'].split(',', 1)[1]), flac.read_bytes())
+            finally:
+                service.shutdown()
+
+            output = root/'output';output.mkdir()
+            with closing(Archive(library)) as archive:
+                result = export_session(archive, archive.sessions()[0], {'format': 'html'}, output, ASSETS,
+                                        lambda _: None, lambda: None)
+            page = self.browser.new_page()
+            try:
+                page.goto(Path(result['path']).as_uri())
+                audio = page.locator('#messages audio')
+                self.assertTrue(audio.evaluate('audio => audio.controls'))
+                played = audio.evaluate("""async audio => {
+                    audio.muted = true;
+                    await audio.play();
+                    return await new Promise(resolve => {
+                        audio.addEventListener('timeupdate', () => resolve(audio.currentTime), {once:true});
+                        setTimeout(() => resolve(audio.currentTime), 3000);
+                    });
+                }""")
+                self.assertGreater(played, 0.05)
+                self.assertEqual(page.locator('#messages video').count(), 1)
+                self.assertNotIn('[视频]', page.locator('#messages').inner_text())
+            finally:
+                page.close()
 
     def test_reply_preview_renders_body_once_and_keeps_distinct_titles_and_quoted_text(self):
         page, errors = self.app()
@@ -658,6 +740,68 @@ class Release125UiTests(unittest.TestCase):
         page.get_by_role('button', name='导出诊断信息', exact=True).click()
         page.wait_for_function('() => window.__calls.includes("storage_cleanup") && window.__calls.includes("choose_diagnostics")')
         self.assertEqual(errors, [])
+
+    def test_cache_migration_displays_the_worker_result_in_settings(self):
+        page, errors = self.app()
+        page.evaluate('''() => {
+          const invoke=window.pywebview.api.invoke;
+          let picked=false;
+          window.pywebview.api.invoke=async(action,payload)=>{
+            if(action==='choose_cache'){
+              picked=true;
+              return {result:{job:'synthetic-migration'}};
+            }
+            const response=await invoke(action,payload);
+            if(action==='state'&&picked){
+              response.result.tasks=[{id:'synthetic-migration',kind:'storage_migrate',status:'failed',
+                detail:'所选文件夹位于当前缓存目录内，请选择上一级或其他位置。'}];
+            }
+            return response;
+          };
+        }''')
+        page.evaluate("window.__wce.setTab('settings')")
+        page.get_by_role('button',name='更改缓存位置',exact=True).click()
+        page.get_by_role('status').get_by_text('所选文件夹位于当前缓存目录内',exact=False).wait_for()
+        self.assertEqual(errors, [])
+
+    def test_batch_task_expands_and_refreshes_conversation_progress(self):
+        page, errors = self.app()
+        page.evaluate('''() => {
+          const invoke=window.pywebview.api.invoke;
+          window.__scanned=250;
+          window.__progressOffsets=[];
+          window.pywebview.api.invoke=async(action,payload)=>{
+            if(action==='task_session_progress'){
+              window.__progressOffsets.push(payload.offset);
+              const rows=payload.offset?[{name:'第二页会话',status:'queued',scanned:0,count:0,total:null}]:
+                [{name:'测试群',status:'running',scanned:window.__scanned,count:2,total:1000}];
+              return {result:{rows,total:41,limit:40}};
+            }
+            const response=await invoke(action,payload);
+            if(action==='state'){
+              response.result.tasks=[{id:'synthetic-batch',kind:'export',category:'sessions',format:'html',
+                title:'批量导出 · 41 个会话',status:'running',progress:25,count:2,session_total:41,
+                has_session_progress:true,created_at:'2026-11-20 00:00'}];
+            }
+            return response;
+          };
+        }''')
+        page.evaluate("window.__wce.setTab('tasks')")
+        toggle=page.get_by_role('button',name='批量导出 · 41 个会话',exact=True)
+        toggle.wait_for()
+        self.assertEqual(page.evaluate('window.__progressOffsets'), [])
+        toggle.click()
+        progress=page.get_by_role('progressbar',name='测试群的导出进度')
+        progress.wait_for()
+        self.assertEqual(progress.get_attribute('aria-valuenow'), '25')
+        page.evaluate('window.__scanned=500')
+        page.wait_for_selector('[aria-label="测试群的导出进度"][aria-valuenow="50"]')
+        page.get_by_role('button',name='下一页',exact=True).click()
+        page.get_by_text('第二页会话',exact=True).wait_for()
+        self.assertIn(40, page.evaluate('window.__progressOffsets'))
+        toggle.press('Enter')
+        self.assertFalse(page.get_by_role('list',name='各会话导出进度').is_visible())
+        self.assertEqual(errors,[])
 
     def test_manual_media_retry_requests_key_recovery_and_displays_the_image(self):
         page, errors = self.app()

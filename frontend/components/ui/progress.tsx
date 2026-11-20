@@ -18,6 +18,7 @@ function Progress({
   return (
     <ProgressPrimitive.Root
       data-slot="progress"
+      value={value}
       className={cn(
         "bg-neutral-200 dark:bg-neutral-700 relative h-2 w-full overflow-hidden rounded-full",
         className
@@ -33,7 +34,7 @@ function Progress({
         style={{ transform: `translateX(-${100 - (value || 0)}%)` }}
       >
         {shimmer && (
-          <div 
+          <div
             className="absolute inset-0 -translate-x-full animate-[shimmer_2s_infinite] bg-gradient-to-r from-transparent via-white/30 dark:via-white/10 to-transparent"
           />
         )}

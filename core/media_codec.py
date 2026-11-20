@@ -7,17 +7,24 @@ import re
 import subprocess
 import tempfile
 import time
+import threading
 import struct
 import wave
-import uuid
 from itertools import islice
 from pathlib import Path
 from Cryptodome.Cipher import AES
 from PIL import Image, UnidentifiedImageError
 from .avatars import image_type
-from .paths import app_data_root
+from .paths import app_data_root, atomic_write_bytes
 from wx4.media import (SIG_V1,SIG_V2,V1_KEY,dat_layout,decode_dat,
                        image_prefix,infer_xor_key,find_dat_aes_key,decrypt_dat_prefix,read_dat_key_probe)
+
+_image_key_cache_lock = threading.Lock()
+
+
+def is_flac_message(message):
+    filename = (message.get('extra') or {}).get('filename') or ''
+    return message.get('kind') == 'file' and isinstance(filename, str) and filename.lower().endswith('.flac')
 
 
 def raster_payload(blob):
@@ -148,12 +155,8 @@ class ImageKeys:
         self.account=Path(data.account_dir());self.wxid=data.wxid;self.xor_search_keys=None
         identity=hashlib.sha256((str(Path(data.account_dir()).resolve())+'\0'+data.wxid).encode()).hexdigest()
         self.path=Path(getattr(data,'cache_root',None) or app_data_root())/'media-cache'/identity/'image-keys.json'
-        try:
-            state=json.loads(self.path.read_text(encoding='utf-8'))
-            self.keys=[bytes.fromhex(k) for k in state.get('keys',[]) if re.fullmatch('[a-fA-F0-9]{32}',k)][:16]
-            key=state.get('xor')
-            if isinstance(key,int) and 0<=key<=255:self.xor=key
-        except (OSError,ValueError,TypeError):pass
+        self.keys, self.xor = self._read_cache()
+        self._saved_xor = self.xor
         legacy=Path(data.root).parent/'media-key.bin'
         if legacy.is_file():
             try:
@@ -161,15 +164,25 @@ class ImageKeys:
                 if len(key)==16 and key not in self.keys:self.keys.append(key)
             except OSError:pass
 
+    def _read_cache(self):
+        try:
+            state = json.loads(self.path.read_text(encoding='utf-8'))
+            keys = [bytes.fromhex(k) for k in state.get('keys', []) if re.fullmatch('[a-fA-F0-9]{32}', k)][:16]
+            xor = state.get('xor')
+            return keys, xor if type(xor) is int and 0 <= xor <= 255 else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return [], None
+
     def _save(self):
         try:
-            self.path.parent.mkdir(parents=True,exist_ok=True)
-            tmp=self.path.with_name(self.path.name+'.'+uuid.uuid4().hex+'.tmp')
-            try:
-                tmp.write_text(json.dumps({'schema':2,'keys':[k.hex() for k in self.keys[-16:]],'xor':self.xor}),encoding='utf-8')
-                os.replace(tmp,self.path)
-            finally:
-                tmp.unlink(missing_ok=True)
+            with _image_key_cache_lock:
+                keys, xor = self._read_cache()
+                keys = list(dict.fromkeys(keys + self.keys))[-16:]
+                if self.xor != self._saved_xor:
+                    xor = self.xor
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(self.path, json.dumps({'schema': 2, 'keys': [k.hex() for k in keys], 'xor': xor}).encode('utf-8'))
+                self.keys, self.xor, self._saved_xor = keys, xor, xor
         except OSError:
             # A read-only cache must not prevent exporting a decrypted image.
             pass
@@ -377,8 +390,12 @@ def silk_stream(blob, cancel):
             if length == -1 and offset == len(raw):
                 offset -= 2
                 break
-            # pysilk's SDK has a 1250-byte per-packet buffer. Zero-length
-            # loss packets also need a decoder API this wrapper does not expose.
+            # Some old WeChat clips have zero-filled alignment bytes after the
+            # last complete frame. Only accept a short and wholly zero tail.
+            if length == 0 and packets and len(raw) - offset <= 254 and (len(raw) - offset) % 2 == 0 and not any(raw[offset:]):
+                offset -= 2
+                break
+            # pysilk's SDK has a 1250-byte per-packet buffer.
             if not 0 < length <= 1250 or offset + length > len(raw):
                 valid = False
                 break
@@ -465,7 +482,10 @@ class MediaCodec:
         import imageio_ffmpeg
         exe=imageio_ffmpeg.get_ffmpeg_exe()
         with tempfile.TemporaryFile() as errors:
-            process=subprocess.Popen([exe,'-hide_banner','-nostdin','-y',*args],
+            # Bound decoder, encoder and filter threads per conversion.
+            args = [*args[:-1], '-threads', '2', args[-1]] if len(args) > args.index('-i') + 2 else args
+            process=subprocess.Popen([exe,'-hide_banner','-nostdin','-y','-filter_threads','1',
+                '-filter_complex_threads','1','-threads','2',*args],
                 stdout=subprocess.DEVNULL,stderr=errors,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
             deadline=time.monotonic()+timeout

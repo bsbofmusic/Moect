@@ -19,6 +19,7 @@ export function StoragePage({
   const [data, setData] = useState<any>(null),
     [busy, setBusy] = useState(false),
     [confirm, setConfirm] = useState(false);
+  const [storageJob, setStorageJob] = useState("");
   const [resetConfirm,setResetConfirm]=useState(false);
   const [hidingHelp, setHidingHelp] = useState(false);
   const hideLimitHelp = async () => {
@@ -70,18 +71,21 @@ export function StoragePage({
       .finally(() => { if (sequence === loadSequence.current) setBusy(false); });
   };
   useEffect(() => {
-    load();
+    if (state.storage_busy) setBusy(false);
+    else load();
     return () => { loadSequence.current += 1; };
   }, [state.storage_dir, state.storage_busy]);
   const active = state.tasks?.some((task: any) =>
     ["queued", "running"].includes(task.status),
   );
+  const storageResult = state.tasks?.find((task: any) => task.id === storageJob);
   const act = async (action: string) => {
     setConfirm(false);
     setResetConfirm(false);
     setBusy(true);
     try {
       const result = await call(action);
+      if (result.job) setStorageJob(result.job);
       if (!result.cancelled) await onChanged();
     } catch (error) {
       onError(error);
@@ -106,7 +110,7 @@ export function StoragePage({
           {data?.roots?.map((root: any) => (
             <div key={root.path}>
               <span>
-                {root.current ? "当前位置" : "历史位置"}{" "}
+                {root.current ? "当前位置" : "旧位置剩余缓存"}{" "}
                 {formatBytes(root.bytes)}
               </span>
               <div className="break-all text-[11px]">{root.path}</div><p className="text-[11px]">快照 {formatBytes(root.categories?.archives||0)} · 媒体缓存 {formatBytes(root.categories?.["media-cache"]||0)} · 头像 {formatBytes(root.categories?.["avatar-cache"]||0)} · 预览 {formatBytes(root.categories?.previews||0)}</p>
@@ -114,6 +118,7 @@ export function StoragePage({
           ))}
         </div>
       </div>
+      {data?.incomplete && <p className="text-xs text-amber-700 dark:text-amber-300">部分缓存暂时无法统计，合计仅包含已读取的文件。</p>}
       <div className="storage-limit space-y-3">
         <div className="flex items-center justify-between gap-3 text-sm">
           <label htmlFor="storage-limit">缓存占用上限</label>
@@ -122,7 +127,7 @@ export function StoragePage({
         <input id="storage-limit" type="range" min="0" max="5" step="1" list="storage-limit-steps"
           value={Math.max(0, STORAGE_LIMITS.indexOf(limit))}
           aria-valuetext={limit ? `${limit} GB` : '不限制'}
-          onChange={event => changeLimit(Number(event.target.value))}/>
+          disabled={state.storage_busy} onChange={event => changeLimit(Number(event.target.value))}/>
         <datalist id="storage-limit-steps">{STORAGE_LIMITS.map((_, index) => <option key={index} value={index}/>)}</datalist>
         <div className="storage-limit-labels" aria-hidden="true">
           {STORAGE_LIMITS.map(value => <span key={value}>{value ? `${value} GB` : '不限制'}</span>)}
@@ -139,7 +144,7 @@ export function StoragePage({
         <Button
           variant="outline"
           className="rounded-full"
-          disabled={busy || active}
+          disabled={busy || active || state.storage_busy}
           onClick={() => act("choose_cache")}
         >
           更改缓存位置
@@ -147,7 +152,7 @@ export function StoragePage({
         <Button
           variant="outline"
           className="rounded-full"
-          disabled={busy || active}
+          disabled={busy || active || state.storage_busy}
           onClick={() => setConfirm(true)}
         >
           清理过期快照与缓存
@@ -155,16 +160,16 @@ export function StoragePage({
         <Button
           variant="ghost"
           className="rounded-full"
-          disabled={busy}
+          disabled={busy || state.storage_busy}
           onClick={load}
         >
           刷新占用
         </Button>
-        {state.storage_warning&&<Button variant="outline" className="rounded-full" disabled={busy||active} onClick={()=>setResetConfirm(true)}>恢复默认缓存位置</Button>}
+        {state.storage_warning&&<Button variant="outline" className="rounded-full" disabled={busy||active||state.storage_busy} onClick={()=>setResetConfirm(true)}>恢复默认缓存位置</Button>}
       </div>
-      {state.storage_busy && (
-        <p className="text-xs text-primary">
-          正在处理存储任务，可在任务页面查看进度。
+      {(state.storage_busy || storageResult?.detail) && (
+        <p role="status" className={storageResult?.status === "failed" && !state.storage_busy ? "text-xs text-red-600 dark:text-red-400" : "text-xs text-primary"}>
+          {state.storage_busy ? "正在处理存储任务，可在任务页面查看进度。" : storageResult.detail}
         </p>
       )}
       <Dialog open={confirm} onOpenChange={setConfirm}>
@@ -172,7 +177,7 @@ export function StoragePage({
           <div className="space-y-2">
             <DialogTitle>清理过期缓存</DialogTitle>
             <DialogDescription className="text-sm leading-relaxed">
-              将清理已不再使用的快照、媒体下载缓存和预览缓存。下次需要时可重新整理或生成。
+              将清理过期快照和可重新生成的缓存，也会清除旧位置中已确认迁移的副本。当前快照和导出文件会保留。
             </DialogDescription>
           </div>
           <div className="mt-6 flex flex-wrap justify-end gap-2">

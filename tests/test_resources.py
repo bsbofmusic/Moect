@@ -102,18 +102,84 @@ class ResourceTests(unittest.TestCase):
                 for m in rows:
                     for r in m['resources']:self.assertTrue((out/r['path']).is_file())
 
-    def test_encrypted_image_is_preserved_and_reported(self):
+    def test_batch_workers_reuse_account_indexes_and_keep_scoped_matches(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from core.resources import BatchMediaIndex, ResourceStore, media_index_rows
+
+        account = Path(self.lib['account_dir'])
+        source = account/'msg/file/fixture.pdf'
+        scoped = Path(self.archive.data.attach_dir(SESSION))/'fixture.pdf'
+        scoped.write_bytes(b'Conversation-specific attachment')
+        forwarded = account/'msg/attach/other'/('d'*32+'.dat')
+        forwarded.parent.mkdir()
+        forwarded.write_bytes(PNG)
+        shared = BatchMediaIndex(self.root)
+
+        def locate(session, folder):
+            folder.mkdir()
+            with closing(Archive(self.lib)) as archive, \
+                 closing(ResourceStore(archive.data, session, folder, batch_media=shared)) as store:
+                regular = store._candidates({'kind':'file', 'extra':{'filename':'fixture.pdf'}})
+                cross_chat = store._candidates({'kind':'image', '_media':{'hashes':['d'*32]}})
+                queries = []
+                store.index.set_trace_callback(queries.append)
+                self.assertEqual(list(store._dat_paths()), list(store._dat_paths()))
+                self.assertEqual(len([sql for sql in queries if 'LIMIT 40' in sql]), 1)
+                return regular, cross_chat
+
+        with patch('core.resources.media_index_rows', wraps=media_index_rows) as walker, ThreadPoolExecutor(2) as pool:
+            own = pool.submit(locate, SESSION, self.root/'own')
+            other = pool.submit(locate, 'other-conversation', self.root/'other')
+            self.assertEqual(own.result(), ([scoped, source], [forwarded]))
+            self.assertEqual(other.result(), ([source], [forwarded]))
+            self.assertEqual(walker.call_count, 4)  # Two scopes, one public index, one cross-chat index.
+
+    def test_deleted_cached_attachment_does_not_abort_later_messages(self):
+        from core.resources import ResourceStore
+
+        out = self.root/'missing-cache';out.mkdir()
+        vanished = self.root/'account/cache/missing.dat'
+        candidates = ResourceStore._candidates
+
+        def with_stale_entry(store, message):
+            if str(message['server_id']) == '10':
+                return [vanished]
+            return candidates(store, message)
+
+        with patch.object(ResourceStore, '_candidates', with_stale_entry):
+            result = export_session(self.archive, self.archive.sessions()[0], {'format': 'json'},
+                                    out, ASSETS, lambda _: None, lambda: None)
+        items = {str(m['server_id']): m for m in json.loads(Path(result['path']).read_text(encoding='utf-8'))['messages']}
+        self.assertEqual(items['10']['resource_status'], 'missing')
+        self.assertIn('暂时无法读取', items['10']['resource_notice'])
+        self.assertEqual(items['10']['resources'], [])
+        self.assertIn('15', items)
+        self.assertFalse(list(out.rglob('*.part')))
+
+    def test_export_recovers_missing_image_key_and_reuses_verified_cache(self):
         h=hashlib.md5(SESSION.encode()).hexdigest()
         p=self.root/'account/msg/attach'/h/'2026-10/Img'/('a'*32+'.dat')
         padded=PNG+bytes([16-len(PNG)%16])*(16-len(PNG)%16)
-        p.write_bytes(SIG_V2+struct.pack('<LL',len(PNG),0)+b'\x00'+AES.new(b'0123456789abcdef',AES.MODE_ECB).encrypt(padded))
-        out=self.root/'encrypted';out.mkdir()
-        with patch('core.media_codec.find_dat_aes_key',return_value=None):
+        key=b'0123456789abcdef'
+        p.write_bytes(SIG_V2+struct.pack('<LL',len(PNG),0)+b'\x00'+AES.new(key,AES.MODE_ECB).encrypt(padded))
+
+        def export(directory):
+            out=self.root/directory;out.mkdir()
             result=export_session(self.archive,self.archive.sessions()[0],{'format':'json'},out,ASSETS,lambda n:None,lambda:None)
-        rows=json.loads(Path(result['path']).read_text(encoding='utf-8'))['messages']
-        msg=next(m for m in rows if str(m['server_id'])=='10')
-        self.assertEqual(msg['resource_status'],'encrypted')
-        self.assertEqual((out/msg['resources'][0]['path']).read_bytes(),p.read_bytes())
+            rows=json.loads(Path(result['path']).read_text(encoding='utf-8'))['messages']
+            msg=next(m for m in rows if str(m['server_id'])=='10')
+            resource = msg['resources'][0]
+            return msg.get('resource_status', resource['status']), (out/resource['path']).read_bytes()
+
+        with patch('core.media_codec.find_dat_aes_key', return_value=None) as recover:
+            self.assertEqual(export('encrypted'), ('encrypted', p.read_bytes()))
+            recover.assert_called_once()
+        with patch('core.media_codec.find_dat_aes_key', return_value=key) as recover:
+            self.assertEqual(export('available'), ('available', PNG))
+            recover.assert_called_once()
+        with patch('core.media_codec.find_dat_aes_key') as recover:
+            self.assertEqual(export('cached'), ('available', PNG))
+            recover.assert_not_called()
 
     def test_native_task_names_migration_delete_and_file_open(self):
         service=Service(ASSETS,self.root/'state');service.library=self.lib
@@ -138,8 +204,11 @@ class ResourceTests(unittest.TestCase):
     def test_reference_db_associates_server_ids(self):
         self.archive.close()
         with closing(sqlite3.connect(self.root/'db/message/message_resource.db')) as con,con:
-            con.execute('CREATE TABLE MessageResourceInfo (msg_svr_id TEXT,packed_info BLOB)')
-            con.execute('INSERT INTO MessageResourceInfo VALUES (?,?)',('11',('b'*32).encode()))
+            con.execute('CREATE TABLE ChatName2Id (user_name TEXT)')
+            con.execute('INSERT INTO ChatName2Id VALUES (?)',(SESSION,))
+            con.execute('CREATE TABLE MessageResourceInfo (msg_svr_id TEXT, chat_name_id, packed_info BLOB)')
+            con.executemany('INSERT INTO MessageResourceInfo VALUES (?,?,?)',[
+                ('11',1,('b'*32).encode()), ('11','1',('b'*32).encode()), ('11',2,('c'*32).encode())])
         table='Msg_'+hashlib.md5(SESSION.encode()).hexdigest()
         with closing(sqlite3.connect(self.root/'db/message/message_0.db')) as con,con:
             con.execute(f'UPDATE "{table}" SET message_content=? WHERE server_id=?',('<msg><videomsg/></msg>','11'))

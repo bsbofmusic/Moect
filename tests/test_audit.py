@@ -92,8 +92,9 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(self.service._cache_readers, 1)
             with self.assertRaises(ValueError):
                 self.service.storage_job('storage_cleanup')
-        with patch('core.service.AvatarStore.blob', side_effect=reading_avatar):
+        with patch('core.service.AvatarStore.url_blob', side_effect=reading_avatar) as avatar:
             self.assertEqual(self.service.avatar('https://qpic.cn/synthetic'), {'url':''})
+        avatar.assert_called_once()
         self.service.library = {'root':'synthetic', 'name':'Synthetic'}
         def reading_catalog(library):
             self.assertEqual(self.service._cache_readers, 1)
@@ -295,21 +296,27 @@ class AuditTests(unittest.TestCase):
         self.assertIn('background:var(--background)', html)
         self.assertIn('a{color:var(--primary)', html)
 
-    def test_concurrent_image_key_saves_use_independent_atomic_files(self):
+    def test_concurrent_image_key_saves_merge_verified_entries(self):
         data = SimpleNamespace(root=str(self.root), wxid='synthetic', cache_root=self.service.root,
                                account_dir=lambda:str(self.root))
         stores = [ImageKeys(data, lambda:None) for _ in range(2)]
+        keys = [bytes([index])*16 for index in range(2)]
+        for store, key in zip(stores, keys):
+            store.keys = [key]
         barrier = threading.Barrier(2, timeout=5)
         temporary_files = []
         rename = os.replace
-        def synchronized_replace(source, destination):
+        def record_replace(source, destination):
             temporary_files.append(Path(source))
-            barrier.wait()
             return rename(source, destination)
-        with patch('core.media_codec.os.replace', side_effect=synchronized_replace), ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(store._save) for store in stores]
+        def save(store):
+            barrier.wait()
+            store._save()
+        with patch('core.paths.os.replace', side_effect=record_replace), ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(save, store) for store in stores]
             for future in futures:
                 future.result(timeout=10)
         self.assertEqual(len(set(temporary_files)), 2)
         self.assertTrue(all(not path.exists() for path in temporary_files))
         self.assertEqual(json.loads(stores[0].path.read_text())['schema'], 2)
+        self.assertEqual(set(ImageKeys(data, lambda:None).keys), set(keys))

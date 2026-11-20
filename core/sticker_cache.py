@@ -15,7 +15,7 @@ from Cryptodome.Util.Padding import unpad
 
 from .account_assets import HASH,text
 from .media_codec import image_prefix,encrypted_media_variants
-from .paths import app_data_root
+from .paths import app_data_root, atomic_write_bytes
 from .game_emojis import game_image
 from wx4.game_emojis import from_hash
 
@@ -107,7 +107,7 @@ class StickerCache:
             self.key=key
             try:
                 self.key_path.parent.mkdir(parents=True,exist_ok=True)
-                temp=self.key_path.with_suffix('.tmp');temp.write_bytes(key);os.replace(temp,self.key_path)
+                atomic_write_bytes(self.key_path, key)
             except OSError:pass
             return plain
         return None

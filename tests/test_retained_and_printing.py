@@ -153,39 +153,60 @@ class BatchQueueTests(unittest.TestCase):
         self.service.library = {'name': 'Synthetic archive', 'root': 'synthetic', 'wxid': 'synthetic'}
         self.service.config['export_dir'] = str(self.root/'exports')
         self.rows = [dict(username='synthetic_' + str(index), display='会话 ' + str(index)) for index in range(125)]
-        self.archive = SimpleNamespace(sessions=lambda: self.rows, close=lambda: None)
+        self.archive = SimpleNamespace(sessions=lambda: self.rows, close=lambda: None, message_count=lambda *_: 1)
 
-    def test_more_than_80_queued_exports_are_all_persisted_and_independently_cancellable(self):
+    def test_more_than_80_conversations_create_one_cancellable_batch(self):
         with patch.object(self.service, 'archive', return_value=self.archive), patch.object(self.service.pool, 'submit') as submit:
             response = self.service.export({'sessions': [row['username'] for row in self.rows]})
-        self.assertEqual(len(response['jobs']), 125)
-        self.assertEqual(submit.call_count, 125)
+        submit.assert_called_once()
+        run, job, work = submit.call_args.args
         saved = json.loads(self.service.config_path.read_text(encoding='utf-8'))
-        self.assertEqual(len(saved['tasks']), 125)
-        first = response['jobs'][0]
-        self.service.cancel(first)
-        function, job, work = submit.call_args_list[0].args
-        function(job, work)
+        self.assertEqual(len(saved['tasks']), 1)
+        self.assertEqual(saved['tasks'][0]['session_total'], 125)
+        public = self.service.state()['tasks'][0]
+        self.assertTrue(public['has_session_progress'])
+        self.assertNotIn('session_progress', public)
+        progress = self.service.task_session_progress({'id':response['job'], 'offset':120})
+        self.assertEqual(progress['total'], 125)
+        self.assertEqual([row['status'] for row in progress['rows']], ['queued']*5)
+        self.service.cancel(response['job'])
+        run(job, work)
         self.assertEqual(job['status'], 'cancelled')
-        self.assertTrue(all(not event.is_set() for key, event in self.service.events.items() if key != first))
-        self.assertEqual(len(self.service.config['tasks']), 125)
+        cancelled = self.service.task_session_progress({'id':response['job']})
+        self.assertEqual(cancelled['rows'][0]['status'], 'cancelled')
+        self.assertFalse((self.root/'exports').exists())
 
-    def test_batch_jobs_keep_their_own_session_files_and_titles(self):
+    def test_batch_creates_one_folder_or_zip_with_separate_conversations(self):
+        from zipfile import ZipFile
         self.rows = self.rows[:12]
+        for row in self.rows:
+            row['display'] = '同名会话'
+
         def export(archive, session, options, folder, assets, progress, cancel, **kwargs):
             path = folder/(session['username'] + '.txt')
             path.write_text(session['username'], encoding='utf-8')
             return dict(path=str(path), name=session['display'], count=1, format='txt')
-        with patch.object(self.service, 'archive', return_value=self.archive), patch.object(self.service.pool, 'submit') as submit:
-            response = self.service.export({'sessions': [row['username'] for row in self.rows], 'format': 'txt'})
-        with patch.object(self.service, 'archive', return_value=self.archive), patch('core.service.export_session', side_effect=export):
-            for call in submit.call_args_list:
-                function, job, work = call.args
+
+        with patch.object(self.service, 'archive', return_value=self.archive), \
+             patch('core.service.export_session', side_effect=export), patch.object(self.service.pool, 'submit') as submit:
+            for zipped in (False, True):
+                response = self.service.export({'sessions': [row['username'] for row in self.rows], 'format': 'txt', 'archiveZip': zipped})
+                function, job, work = submit.call_args.args
                 function(job, work)
-        self.assertEqual(len(response['jobs']), 12)
-        for task, session in zip(self.service.config['tasks'], self.rows):
-            self.assertEqual((task['status'], task['session']), ('completed', session['username']))
-            self.assertEqual(Path(task['files'][0]['path']).read_text(encoding='utf-8'), session['username'])
+                self.assertEqual(job['status'], 'completed', job['detail'])
+                self.assertEqual(job['session_exported'], 12)
+                path = self.service.task_file(response['job'])
+                if zipped:
+                    with ZipFile(path) as archive:
+                        names = archive.namelist()
+                        self.assertEqual(len({name.split('/')[0] for name in names}), 1)
+                        self.assertEqual(len([name for name in names if name.endswith('/index.html')]), 1)
+                        texts = {archive.read(name).decode('utf-8') for name in names if name.endswith('.txt')}
+                else:
+                    self.assertEqual(path.name, 'index.html')
+                    self.assertEqual(len(list(path.parent.glob('*/'))), 12)
+                    texts = {entry.read_text(encoding='utf-8') for entry in path.parent.glob('*/*.txt')}
+                self.assertEqual(texts, {row['username'] for row in self.rows})
 
     def test_failed_batch_save_enqueues_nothing_and_rolls_back_in_memory(self):
         with patch.object(self.service, 'archive', return_value=self.archive), patch.object(self.service.pool, 'submit') as submit, patch.object(self.service, 'save', side_effect=OSError('Synthetic disk failure')):
@@ -194,6 +215,106 @@ class BatchQueueTests(unittest.TestCase):
         submit.assert_not_called()
         self.assertEqual(self.service.config['tasks'], [])
         self.assertEqual(self.service.events, {})
+
+    def test_batch_progress_is_weighted_by_scanned_rows(self):
+        self.rows = self.rows[:2]
+        short, long = (row['username'] for row in self.rows)
+        self.archive.message_count = lambda session, *_: 1 if session == short else 10_000
+        snapshots = []
+
+        def scheduler(count, work, *args):
+            self.assertEqual(count, 2)
+            short_result = work(1)  # The longest conversation is scheduled first.
+            self.assertEqual(short_result[0], 0)
+            yield short_result
+            snapshots.append(job['progress'])
+            yield work(0)
+
+        def export(archive, session, options, folder, assets, progress, cancel, **kwargs):
+            if session['username'] == long:
+                kwargs['scan_progress'](5000, 7)  # Most of the scanned rows are filtered out.
+                snapshots.append(job['progress'])
+                self.assertEqual(job['count'], 8)
+                short_row, long_row = self.service.task_session_progress({'id':job['id']})['rows']
+                self.assertEqual((short_row['status'], short_row['scanned']), ('completed', 1))
+                self.assertEqual((long_row['status'],long_row['scanned'],long_row['total'],long_row['count']),
+                                 ('running',5000,10_000,7))
+            path = folder/'record.txt'
+            path.write_text(session['username'], encoding='utf-8')
+            return dict(path=str(path), name=session['display'], count=1 if session['username'] == short else 10, format='txt')
+
+        with patch.object(self.service, 'archive', return_value=self.archive), \
+             patch.object(self.service, '_run_export_batch', side_effect=scheduler), \
+             patch('core.service.export_session', side_effect=export), \
+             patch.object(self.service.pool, 'submit') as submit:
+            self.service.export({'sessions': [short, long], 'format': 'txt'})
+            run, job, work = submit.call_args.args
+            run(job, work)
+            self.assertEqual(job['status'], 'completed', job['detail'])
+            self.assertEqual(job['progress'], 100)
+        self.assertLess(snapshots[0], 10)
+        self.assertTrue(45 <= snapshots[1] <= 49)
+
+    def test_last_export_survives_reload_and_history_cleanup_is_scoped_to_account(self):
+        self.service.library['account_dir'] = str(self.root/'account-a')
+        original_library = dict(self.service.library)
+        expected = [row['username'] for row in self.rows[:2]]
+
+        def export(archive, session, options, folder, assets, progress, cancel, **kwargs):
+            path = folder/'record.txt'
+            path.write_text(session['username'], encoding='utf-8')
+            return dict(path=str(path), name=session['display'], count=1, format='txt')
+
+        with patch.object(self.service, 'archive', return_value=self.archive), \
+             patch('core.service.export_session', side_effect=export), patch.object(self.service.pool, 'submit') as submit:
+            self.service.export({'sessions': expected, 'format': 'txt'})
+            run, job, work = submit.call_args.args
+            run(job, work)
+            self.assertEqual(job['status'], 'completed')
+            self.assertTrue(self.service.state()['last_export_available'])
+            self.service.delete_tasks({'clear': True})
+            cancelled = self.service.export({'sessions': [self.rows[3]['username']], 'format': 'txt'})
+            self.service.cancel(cancelled['job'])
+            run, job, work = submit.call_args.args
+            run(job, work)
+            self.assertEqual(self.service.last_export_sessions(), expected)
+
+        reloaded = Service(ASSETS, self.service.root)
+        self.addCleanup(reloaded.shutdown)
+        reloaded.library = {**original_library, 'root': str(self.root/'new-snapshot')}
+        self.assertEqual(reloaded.last_export_sessions(), expected)
+        reloaded.library = {**original_library, 'account_dir': str(self.root/'account-b')}
+        self.assertEqual(reloaded.last_export_sessions(), [])
+        self.assertFalse(reloaded.state()['last_export_available'])
+
+    def test_batch_limits_concurrency_and_resumes_when_memory_is_available(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        memory = SimpleNamespace(total=8 * 1024**3, available=1024**3)
+        started = [threading.Event() for _ in range(3)]
+        release = threading.Event()
+        def work(index):
+            started[index].set()
+            if not release.wait(5):
+                raise TimeoutError('Synthetic export timed out')
+            return index
+
+        with patch('core.service.psutil.cpu_count', return_value=4), \
+             patch('core.service.psutil.cpu_percent', return_value=10), \
+             patch('core.service.psutil.virtual_memory', return_value=memory), ThreadPoolExecutor(1) as coordinator:
+            done = coordinator.submit(lambda: list(
+                self.service._run_export_batch(3, work, lambda: None, lambda: None)))
+            try:
+                self.assertTrue(started[0].wait(2))
+                self.assertFalse(started[1].wait(0.55))
+                memory.available = 4 * 1024**3
+                self.assertTrue(started[1].wait(2))
+                self.assertFalse(started[2].is_set())
+            finally:
+                release.set()
+            self.assertEqual(sorted(done.result(timeout=5)), [0, 1, 2])
+        self.assertTrue(all(event.is_set() for event in started))
 
 
 class OfflinePrintingTests(unittest.TestCase):
@@ -247,6 +368,33 @@ class OfflinePrintingTests(unittest.TestCase):
         self.page.locator('#print').click()
         self.page.wait_for_function('() => !MoectPrint.busy && window.__printed.rows===1')
         self.assertEqual(self.errors, [])
+
+    def test_chat_pagination_keeps_the_selected_colors_on_hover(self):
+        with closing(Archive(fixture(self.root/'分页数据库', count=81))) as archive:
+            for mode, accent in (('light', 'violet'), ('dark', 'blue')):
+                with self.subTest(mode=mode, accent=accent):
+                    folder = self.root/mode
+                    folder.mkdir()
+                    result = export_session(archive, archive.sessions()[0],
+                                            {'format':'html','quickExport':True,'_theme':{'mode':mode,'accent':accent}},
+                                            folder, ASSETS, lambda _: None, lambda: None)
+                    self.page.goto(Path(result['path']).as_uri())
+                    self.page.wait_for_function('() => !reading && total===81')
+                    current = self.page.locator('#page-buttons button[aria-current="page"]')
+                    other = self.page.locator('#page-buttons button:not([aria-current])')
+                    colors = 'button=>{const style=getComputedStyle(button);return [style.backgroundColor,style.color,style.borderColor]}'
+                    self.page.locator('h1').hover()
+                    selected_colors = current.evaluate(colors)
+                    current.hover()
+                    self.assertEqual(current.evaluate(colors), selected_colors)
+                    normal_colors = other.evaluate(colors)
+                    other.hover()
+                    hovered_colors = other.evaluate(colors)
+                    self.assertNotEqual(hovered_colors[0], normal_colors[0])
+                    self.assertEqual(hovered_colors[1:], [selected_colors[0]]*2)
+                    other.click()
+                    self.page.wait_for_function('() => !reading && page===0')
+                    self.assertEqual(current.get_attribute('aria-label'), '第 1 页')
 
     def test_moments_link_is_content_width_and_print_honors_all_filtered_posts(self):
         (self.root/'image.png').write_bytes(PNG)

@@ -1,25 +1,317 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'"><title>微信收藏归档</title>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; media-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'">
+<title>微信收藏归档</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#f7f5fb;color:#292137;font:14px/1.8 "Microsoft YaHei",sans-serif}header,main,footer{max-width:1100px;margin:auto;padding:24px}h1{font-size:26px;margin:0 0 8px;font-weight:500}button,input,select{font:inherit;color:inherit;background:#fff;border:1px solid #e6deef;border-radius:10px;padding:7px 12px}button{cursor:pointer}button:disabled{opacity:.4;cursor:default}.muted{color:#7e718f;font-size:12px}.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0}#query{flex:1;min-width:160px}.card{padding:24px;margin:0 0 18px;border:1px solid #e6deef;background:#fff;border-radius:16px;overflow-wrap:anywhere}.card h2{font-size:19px;font-weight:500;margin:8px 0}.copy{white-space:pre-wrap}.block{padding:12px 0;border-top:1px solid #e6deef}.block .block{margin-left:18px}.sender{font-size:12px;color:#7056c4}.resource{display:block;margin:12px 0}.resource img{display:block;max-width:100%;max-height:500px;object-fit:contain;border-radius:8px}.resource video{max-width:100%;max-height:500px}.resource audio{max-width:100%}a{color:#7056c4;overflow-wrap:anywhere}.notice{font-size:12px;color:#7e718f}footer{display:flex;justify-content:center;gap:12px;align-items:center}details>summary{cursor:pointer;color:#7056c4;padding:8px 0}#status{min-height:22px}@media(max-width:650px){header,main,footer{padding:16px}.card{padding:18px}.filters>*{max-width:100%}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--background);color:var(--foreground);font:14px/1.65 'HarmonyOS Sans SC','Microsoft YaHei UI',system-ui}
+header,main,footer{width:min(940px,100% - 40px);margin-inline:auto}
+header{padding-top:38px}
+.heading,.card-meta,.card-footer,.list-bar,.toolbar,.actions,footer{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.heading,.card-footer,.list-bar{justify-content:space-between}
+h1,h2,p{margin:0}
+h1{font-size:clamp(22px,4vw,30px);line-height:1.35;font-weight:650;overflow-wrap:anywhere}
+h2{font-size:19px;line-height:1.45;font-weight:650;overflow-wrap:anywhere}
+.muted,.notice{font-size:12px;color:var(--muted-foreground)}
+#meta{margin-top:6px}
+.toolbar{margin-top:18px;padding:11px;background:var(--card);border:1px solid var(--border);border-radius:14px}
+.toolbar input,.toolbar select,.toolbar button,.heading button,footer button{
+  font:inherit;color:inherit;background:var(--card);border:1px solid var(--border);border-radius:9px;padding:6px 11px;line-height:1.5
+}
+.toolbar #query{flex:1 1 220px;min-width:0;background:var(--muted);border-color:transparent}
+.heading #print{white-space:nowrap}
+input::placeholder{color:var(--muted-foreground)}
+button,summary{cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+a{color:var(--primary);text-decoration:none;overflow-wrap:anywhere}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+.list-bar{margin:12px 1px 14px}
+.actions{gap:14px}
+.actions a{font-size:12px}
+.archive-note>summary{font-size:12px;color:var(--muted-foreground)}
+.archive-note>p{max-width:52ch;margin-top:4px}
+#items{display:grid;gap:12px}
+.card{min-width:0;padding:18px 20px;background:var(--card);border:1px solid var(--border);border-radius:14px;overflow-wrap:anywhere}
+.card-meta{gap:5px 10px;margin-bottom:7px;color:var(--muted-foreground);font-size:12px}
+.card-meta time{margin-inline-start:auto;font-variant-numeric:tabular-nums}
+.category{padding:1px 8px;border-radius:6px;background:var(--secondary);color:var(--secondary-foreground)}
+.copy{white-space:pre-wrap;overflow-wrap:anywhere}
+.intro{margin-top:8px}
+.entry-flow{display:grid;gap:10px;margin-top:12px}
+.block{min-width:0;display:grid;gap:6px}
+.block-title{font-weight:600}
+.sender{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted-foreground)}
+.sender strong{color:var(--primary);font-weight:600}
+.transcript,.nested-flow{padding:10px 12px;border-inline-start:2px solid var(--border);background:var(--muted);border-radius:0 8px 8px 0}
+.transcript>.block+.block{border-top:1px solid var(--border);padding-top:9px}
+.resource{min-width:0}
+.gallery{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;max-width:640px}
+.gallery.single{display:block;max-width:540px}
+.photo-link{display:block;border-radius:8px;background:var(--muted);overflow:hidden}
+.photo-link img{display:block;max-width:100%;width:100%;height:auto;max-height:440px;object-fit:contain}
+.gallery.single .photo-link{width:fit-content;max-width:100%}
+.gallery.single img{width:auto}
+.gallery:not(.single) img{height:140px}
+.resource audio,.resource video{display:block;max-width:100%;border-radius:8px}
+.resource video{max-height:440px}
+.media-download{display:inline-block;margin-top:4px;font-size:12px}
+.attachment{display:inline-flex;align-items:center;width:fit-content;max-width:100%;padding:5px 9px;border-radius:7px;background:var(--muted);font-size:12px}
+.expand{margin-top:12px}
+.expand>summary{width:fit-content;padding:5px 9px;border-radius:7px;background:var(--muted);color:var(--primary);font-size:13px}
+.expand>.entry-flow{margin-top:9px}
+.card-footer{justify-content:flex-start;margin-top:12px;padding-top:9px;border-top:1px solid var(--border)}
+.card-footer a{font-size:12px}
+.empty{padding:3rem 1rem;text-align:center;color:var(--muted-foreground)}
+footer{justify-content:center;padding-block:20px 30px;color:var(--muted-foreground)}
+[hidden]{display:none!important}
+@media(max-width:600px){
+  header,main,footer{width:calc(100% - 24px)}
+  header{padding-top:20px}
+  .card{padding:14px}
+  .toolbar #query{flex-basis:100%}
+  .gallery{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .gallery:not(.single) img{height:110px}
+}
+@media print{.transcript,.nested-flow{background:transparent}}
 </style>
-<header><h1 id="title"></h1><p id="meta" class="muted"></p><p id="notice" class="notice"></p><div class="filters"><input id="query" type="search" placeholder="搜索收藏内容" aria-label="搜索收藏内容"><select id="type" aria-label="收藏类型"><option value="">全部类型</option></select><moect-date-range id="date-range"></moect-date-range><button id="reset">显示全部</button><button id="print">打印 / 保存 PDF</button></div><p id="status" class="muted" role="status"></p><a href="data.json" download>归档 JSON</a> · <a href="resource-report.jsonl" download>资源明细</a></header><main id="items"></main><footer><button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button></footer>
-<script>__DATE_RANGE_PICKER__</script><script>__ARCHIVE_MEDIA__</script><script>__ARCHIVE_PRINT__</script>
-<script src="builtin-faces.js"></script><script>__INLINE_FACES__</script>
+</head>
+<body>
+<header>
+  <div class="heading"><h1 id="title"></h1><button id="print">打印 / 保存 PDF</button></div>
+  <p id="meta" class="muted"></p>
+  <div class="toolbar">
+    <input id="query" type="search" placeholder="搜索标题、正文或来源" aria-label="搜索收藏内容">
+    <select id="type" aria-label="收藏类型"><option value="">全部类型</option></select>
+    <moect-date-range id="date-range"></moect-date-range>
+    <button id="reset">显示全部</button>
+  </div>
+  <div class="list-bar">
+    <p id="status" class="muted" role="status"></p>
+    <div class="actions">
+      <a href="data.json" download>归档 JSON</a>
+      <a href="resource-report.jsonl" download>资源明细</a>
+      <details class="archive-note"><summary>归档说明</summary><p id="notice" class="notice"></p></details>
+    </div>
+  </div>
+</header>
+<main id="items"></main>
+<footer id="pages">
+  <button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button>
+</footer>
+<script>__DATE_RANGE_PICKER__</script>
+<script>__ARCHIVE_MEDIA__</script>
+<script>__ARCHIVE_PRINT__</script>
+<script src="builtin-faces.js"></script>
+<script>__INLINE_FACES__</script>
 <script>
-const data=__FAVORITES__,$=s=>document.querySelector(s),size=40;let page=0,start='',end='';
-function node(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text){if(cls==='copy')MoectFaces.append(el,text);else el.textContent=text}return el}
-function local(path){return typeof path==='string'&&!/^[a-z]+:|^[/\\]|\\/i.test(path)&&!path.split('/').includes('..')?path:''}
-function external(url){try{const u=new URL(url);return ['https:','http:'].includes(u.protocol)&&!u.username?u.href:''}catch{return ''}}
-function link(url,label,isLocal=false){const href=isLocal?local(url):external(url);if(!href)return node('span','',label);const a=node('a','',label);a.href=href;a.target='_blank';a.rel='noopener noreferrer';return a}
-function renderBlock(block){const el=node('section','block');if(block.sender)el.append(node('p','sender',[block.sender,block.time].filter(Boolean).join(' · ')));if(block.title)el.append(node('p','',block.title));if(block.text)el.append(node('p','copy',block.text));if(block.link)el.append(link(block.link,'打开原链接'));
-for(const r of block.resources||[]){if(!local(r.path))continue;const wrap=node('div','resource');if(r.kind==='image'){const a=link(r.path,'',true),img=node('img');a.className='photo-link';img.src=r.path;img.alt=r.name||'收藏图片';img.loading='lazy';a.append(img);wrap.append(a)}else if(['video','audio'].includes(r.kind)){const media=node(r.kind);media.src=r.path;media.controls=true;media.preload='none';wrap.append(media)}wrap.append(link(r.path,r.name||'下载文件',true));el.append(wrap)}if(block.notice)el.append(node('p','notice',block.notice));for(const child of block.children||[])el.append(renderBlock(child));return el}
-function card(item){const el=node('article','card');el.append(node('div','muted',[item.type_name,item.source,item.create_time?new Date(item.create_time*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}):''].filter(Boolean).join(' · ')),node('h2','',item.title));if(item.text&&item.text!==item.title)el.append(node('p','copy',item.text));if(item.link)el.append(link(item.link,'打开原链接'));const blocks=node('div');for(const block of item.blocks||[])blocks.append(renderBlock(block));if(item.blocks?.length>6){const detail=node('details'),summary=node('summary','','展开内容（'+item.blocks.length+' 项）');detail.append(summary,blocks);el.append(detail)}else el.append(blocks);if(item.article_notice)el.append(node('p','notice',item.article_notice));if(local(item.markdown))el.append(link(item.markdown,'打开 Markdown 文件',true));return el}
-function timestamp(value,last=false){if(value.length===10)value+='T'+(last?'23:59:59':'00:00:00');else if(value.length===16)value+=last?':59':':00';return Date.parse(value+'+08:00')/1000}
-function rows(){const query=$('#query').value.trim().toLocaleLowerCase(),type=$('#type').value;return data.items.filter(item=>(!type||String(item.type)===type)&&(!start||item.create_time>=timestamp(start))&&(!end||item.create_time<=timestamp(end,true))&&(!query||JSON.stringify(item).toLocaleLowerCase().includes(query)))}
-function render(){const all=rows(),pages=Math.max(1,Math.ceil(all.length/size));page=Math.max(0,Math.min(page,pages-1));$('#items').replaceChildren(...all.slice(page*size,(page+1)*size).map(card));$('#status').textContent='共 '+all.length+' 条收藏';$('#page').textContent=(page+1)+' / '+pages;$('#prev').disabled=page===0;$('#next').disabled=page+1>=pages}
-$('#title').textContent=data.name;$('#meta').textContent='由 Moect 导出 · '+data.exported_at;$('#notice').textContent=data.notice;
-for(const [id,label] of new Map(data.items.map(item=>[item.type,item.type_name]))){const option=node('option','',label);option.value=id;$('#type').append(option)}
-$('#query').oninput=$('#type').onchange=()=>{page=0;render()};$('#date-range').addEventListener('range-change',event=>{start=event.detail.start;end=event.detail.end;page=0;render()});$('#reset').onclick=()=>{$('#query').value=$('#type').value='';start=end='';$('#date-range').setAttribute('start','');$('#date-range').setAttribute('end','');page=0;render()};$('#prev').onclick=()=>{page--;render();scrollTo(0,0)};$('#next').onclick=()=>{page++;render();scrollTo(0,0)};
-$('#print').onclick=()=>MoectPrint.print({title:data.name,description:$('#status').textContent,render:root=>{const all=rows();for(const item of all){const el=card(item);for(const details of el.querySelectorAll('details'))details.open=true;root.append(el)}return all.length}});
-render();MoectMedia.mount($('#items'));
-</script></html>
+const data=__FAVORITES__;
+const $=selector=>document.querySelector(selector);
+const pageSize=40;
+const clock=new Intl.DateTimeFormat('zh-CN',{dateStyle:'medium',timeStyle:'short',timeZone:'Asia/Shanghai'});
+const searchText=new WeakMap();
+let page=0,start='',end='';
+
+function node(tag,cls,text){
+  const el=document.createElement(tag);
+  if(cls)el.className=cls;
+  if(text){
+    if(cls?.includes('copy'))MoectFaces.append(el,text);
+    else el.textContent=text;
+  }
+  return el;
+}
+
+function local(path){
+  if(typeof path!=='string'||!path||/^[a-z][a-z0-9+.-]*:|^[/\\]|[\\\x00-\x1f]/i.test(path))return '';
+  const parts=path.split('/');
+  return parts.some(part=>!part||part==='.'||part==='..')?'':parts.map(encodeURIComponent).join('/');
+}
+
+function external(value){
+  try{
+    const url=new URL(value);
+    return ['https:','http:'].includes(url.protocol)&&!url.username&&!url.password?url.href:'';
+  }catch{return ''}
+}
+
+function link(href,label,cls='',download=false){
+  const a=node('a',cls,label);
+  a.href=href;
+  if(download)a.download='';
+  else{a.target='_blank';a.rel='noopener noreferrer'}
+  return a;
+}
+
+function renderResources(parent,resources){
+  let gallery;
+  for(const resource of resources||[]){
+    const href=local(resource.path);
+    if(!href)continue;
+    if(resource.kind==='image'){
+      if(!gallery){
+        gallery=node('div','resource gallery single');
+        parent.append(gallery);
+      }else gallery.classList.remove('single');
+      const a=link(href,'','photo-link');
+      const image=node('img');
+      image.src=href;
+      image.alt=resource.role==='thumbnail'?'收藏图片缩略图':'收藏图片';
+      image.loading='lazy';
+      image.decoding='async';
+      a.append(image);gallery.append(a);
+      continue;
+    }
+    gallery=null;
+    const wrap=node('div','resource');
+    if(resource.kind==='audio'||resource.kind==='video'){
+      const media=node(resource.kind);
+      media.src=href;media.controls=true;media.preload='none';
+      wrap.append(media,link(href,resource.kind==='audio'?'下载音频':'下载视频','media-download',true));
+    }else{
+      const filename=String(resource.name||'');
+      const useful=filename&&!/^[a-f0-9]{24,64}(?:\.[a-z0-9]+)?$/i.test(filename);
+      wrap.append(link(href,useful?filename:'下载原始附件','attachment',true));
+    }
+    parent.append(wrap);
+  }
+}
+
+function renderBlock(block,repeated){
+  const el=node('section','block');
+  if(block.sender||block.time){
+    const sender=node('div','sender');
+    if(block.sender)sender.append(node('strong','',block.sender));
+    if(block.time)sender.append(node('span','',block.time));
+    el.append(sender);
+  }
+  const hideTitle=!block.sender&&repeated?.text.has((block.title||'').trim());
+  const hideText=!block.sender&&repeated?.text.has((block.text||'').trim());
+  if(block.title&&!hideTitle&&!(block.title==='文章图片'&&(block.resources||[]).length))el.append(node('p','block-title',block.title));
+  if(block.text&&!hideText&&block.text!==block.title)el.append(node('p','copy',block.text));
+  const href=external(block.link);
+  if(href&&(href!==repeated?.link||block.sender))el.append(link(href,'打开原链接','attachment'));
+  renderResources(el,block.resources);
+  if(block.notice)el.append(node('p','notice',block.notice));
+  if(block.children?.length)el.append(renderFlow(block.children,'nested-flow'));
+  return el;
+}
+
+function renderFlow(blocks,cls,repeated){
+  const flow=node('div','entry-flow '+cls);
+  for(const block of blocks){
+    const content=renderBlock(block,repeated);
+    if(content.childElementCount)flow.append(content);
+  }
+  return flow;
+}
+
+function card(item,printing=false){
+  const el=node('article','card');
+  const meta=node('div','card-meta');
+  meta.append(node('span','category',item.type_name));
+  if(item.source)meta.append(node('span','',item.source));
+  if(item.create_time){
+    const date=new Date(item.create_time*1000);
+    if(Number.isFinite(date.getTime()))meta.append(node('time','',clock.format(date)));
+  }
+  el.append(meta,node('h2','',item.title));
+  if(item.text&&(item.text||'').trim()!==(item.title||'').trim())el.append(node('p','copy intro',item.text));
+  const url=external(item.link);
+  const repeated=item.type===14?null:{text:new Set([(item.title||'').trim(),(item.text||'').trim()]),link:url};
+  const blocks=item.blocks||[];
+  const flow=()=>renderFlow(blocks,item.type===14?'transcript':'',repeated);
+  if(blocks.length>6||item.type===14&&blocks.length>3){
+    const details=node('details','expand');
+    const label=item.type===14?'查看聊天记录':item.type===5?'阅读正文':'展开内容';
+    details.append(node('summary','',label));
+    const populate=()=>{if(details.childElementCount===1)details.append(flow())};
+    if(printing){populate();details.open=true}
+    else details.addEventListener('toggle',()=>{if(details.open)populate()});
+    el.append(details);
+  }else if(blocks.length){
+    const body=flow();
+    if(body.childElementCount)el.append(body);
+  }
+  if(item.article_notice)el.append(node('p','notice intro',item.article_notice));
+  const markdown=local(item.markdown);
+  if(url||markdown){
+    const actions=node('div','card-footer');
+    if(url)actions.append(link(url,'打开原链接'));
+    if(markdown)actions.append(link(markdown,'Markdown'));
+    el.append(actions);
+  }
+  return el;
+}
+
+function timestamp(value,last=false){
+  if(value.length===10)value+='T'+(last?'23:59:59':'00:00:00');
+  else if(value.length===16)value+=last?':59':':00';
+  return Date.parse(value+'+08:00')/1000;
+}
+
+function textForSearch(item){
+  if(searchText.has(item))return searchText.get(item);
+  const parts=[item.title,item.text,item.source,item.link,item.type_name];
+  const collect=block=>{
+    parts.push(block.title,block.text,block.sender,block.time,block.link,block.notice);
+    for(const resource of block.resources||[])parts.push(resource.name);
+    for(const child of block.children||[])collect(child);
+  };
+  for(const block of item.blocks||[])collect(block);
+  const text=parts.filter(Boolean).join(' ').toLocaleLowerCase();
+  searchText.set(item,text);
+  return text;
+}
+
+function rows(){
+  const query=$('#query').value.trim().toLocaleLowerCase(),type=$('#type').value;
+  const from=start?timestamp(start):null,to=end?timestamp(end,true):null;
+  return data.items.filter(item=>(!type||String(item.type)===type)&&(from===null||item.create_time>=from)&&
+    (to===null||item.create_time<=to)&&(!query||textForSearch(item).includes(query)));
+}
+
+function render(){
+  const matched=rows(),pages=Math.max(1,Math.ceil(matched.length/pageSize));
+  page=Math.max(0,Math.min(page,pages-1));
+  const items=$('#items');
+  const visible=matched.slice(page*pageSize,(page+1)*pageSize);
+  items.replaceChildren(...(visible.length?visible.map(item=>card(item)):[node('p','empty','没有符合条件的收藏')]));
+  $('#status').textContent=matched.length===data.items.length?'共 '+matched.length+' 条收藏':
+    '匹配 '+matched.length+' / '+data.items.length+' 条收藏';
+  $('#page').textContent=(page+1)+' / '+pages;
+  $('#pages').hidden=pages<2;$('#prev').disabled=page===0;$('#next').disabled=page+1>=pages;
+}
+
+$('#title').textContent=data.name;
+document.title=data.name+' · Moect';
+$('#meta').textContent='导出于 '+data.exported_at.replace('T',' ');
+$('#notice').textContent=data.notice;
+for(const [id,label] of new Map(data.items.map(item=>[item.type,item.type_name]))){
+  const option=node('option','',label);
+  option.value=id;$('#type').append(option);
+}
+$('#query').oninput=$('#type').onchange=()=>{page=0;render()};
+$('#date-range').addEventListener('range-change',event=>{start=event.detail.start;end=event.detail.end;page=0;render()});
+$('#reset').onclick=()=>{
+  $('#query').value=$('#type').value='';start=end='';
+  $('#date-range').setAttribute('start','');$('#date-range').setAttribute('end','');page=0;render();
+};
+$('#prev').onclick=()=>{page--;render();scrollTo(0,0)};
+$('#next').onclick=()=>{page++;render();scrollTo(0,0)};
+$('#print').onclick=async()=>{
+  try{
+    await MoectPrint.print({
+      title:data.name,description:$('#status').textContent,
+      render:root=>{const matched=rows();for(const item of matched)root.append(card(item,true));return matched.length}
+    });
+  }catch(error){$('#status').textContent=error.message}
+};
+render();
+MoectMedia.mount($('#items'));
+</script>
+</body>
+</html>
