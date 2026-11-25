@@ -10,7 +10,7 @@ import {revealTheme} from './themeReveal'
 import {ThemeToggleIcon} from './ThemeToggleIcon'
 import './theme-toggle.css'
 import {motion,AnimatePresence} from 'framer-motion'
-import {Activity,MessageCircle,Zap,Settings,HelpCircle,PanelLeftClose,PanelLeftOpen,RefreshCw,LogOut,Sticker,Images,Bookmark} from 'lucide-react'
+import {Activity,Check,MessageCircle,Zap,Settings,HelpCircle,PanelLeftClose,PanelLeftOpen,RefreshCw,LogOut,Sticker,Images,Bookmark} from 'lucide-react'
 import {Button} from '@/components/ui/button'
 import {WindowDragRegion,WindowControls} from '@/components/ui/window-controls'
 import {Avatar,AvatarFallback,AvatarImage} from '@/components/ui/avatar'
@@ -35,6 +35,18 @@ import {ImageRecoveryHelp} from './ImageRecoveryHelp'
 
 const titles:Record<string,string>={overview:'概览',sessions:'会话',tasks:'任务',stickers:'表情包',moments:'朋友圈',settings:'设置',about:'关于',favorites:'收藏'}
 const active=(status:string)=>status==='queued'||status==='running'
+const report=(error:any)=>toast.error('操作未完成',{description:error.message,duration:Infinity})
+
+function notifyExportComplete(taskId:string){
+  toast.success(<span className="inline-flex items-center gap-1.5"><Check className="size-3.5 text-primary" aria-hidden="true"/>导出完成</span>,{
+    duration:8000,
+    description:<p>如果 Moect 帮你省了点时间，欢迎点个 <button type="button" role="link"
+        aria-label="去 GitHub 给 Moect 点 Star"
+        className="cursor-pointer rounded-sm text-primary underline underline-offset-3 hover:no-underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        onClick={()=>void call('source',{name:'project'}).catch(report)}>Star</button>。</p>,
+    action:{label:'打开文件位置',onClick:()=>void call('open_task_folder',{id:taskId}).catch(report)},
+  })
+}
 
 export function App(){
   useWindowEdges()
@@ -50,9 +62,9 @@ export function App(){
   const [connecting,setConnecting]=useState(false)
   const [changingAppearance,setChangingAppearance]=useState(false),appearanceBusy=useRef(false)
   const connectJob=useRef(''),autoConnect=useRef(false),quietConnect=useRef(false),refreshing=useRef(false),stateRef=useRef<any>(null)
+  const notifiedExports=useRef(new Set<string>())
   const libraryEpoch=useRef(0),loadSequence=useRef(0),changingLibrary=useRef(false)
   const pendingSort=useRef<any>(null),sortSequence=useRef(0),sortQueue=useRef<Promise<any>>(Promise.resolve())
-  const report=(error:any)=>toast.error('操作未完成',{description:error.message,duration:Infinity})
   const update=useCallback((data:any,appearanceOnly=false)=>{
     const current=stateRef.current
     // Only explicit appearance actions change an initialized theme. A delayed
@@ -65,6 +77,11 @@ export function App(){
     stateRef.current=data
     document.documentElement.classList.toggle('dark',data.theme==='dark')
     for(const [key,value] of Object.entries(data.appearance||{}))document.documentElement.style.setProperty('--'+key,String(value))
+    for(const task of data.tasks){
+      if(task.kind!=='export'||task.status!=='completed'||notifiedExports.current.has(task.id))continue
+      notifiedExports.current.add(task.id)
+      if(current)notifyExportComplete(task.id)
+    }
   },[])
   const saveSessionSort=useCallback((preference:any)=>{
     const sequence=++sortSequence.current;pendingSort.current=preference
@@ -97,7 +114,22 @@ export function App(){
           if(t.status==='failed')automatic?toast.warning('自动连接未完成',{description:t.detail}):report(new Error(t.detail))
         }
       }
-      if(old){const previous=new Map(old.tasks.map((t:any)=>[t.id,t]));let completed=0;for(const t of data.tasks){const prev:any=previous.get(t.id);if((!prev&&t.kind!=='recover_images')||prev?.status===t.status)continue;if(t.status==='completed'&&t.kind==='export')completed++;if(t.kind==='refresh_assets'&&t.status==='completed')toast.success('表情包和朋友圈快照已更新');if(t.kind==='refresh_assets'&&t.status==='failed')report(new Error(t.detail));if(t.kind==='recover_images'&&t.status==='completed'){toast.success('图片读取已恢复',{description:t.detail});window.dispatchEvent(new Event('moect-media-recovered'))}if(t.kind==='recover_images'&&t.status==='failed')report(new Error(t.detail))}if(completed)toast.success(completed===1?'导出完成':`已完成 ${completed} 个导出任务`,{action:{label:'查看任务',onClick:()=>setTab('tasks')}})}
+      if(old){
+        const previous=new Map(old.tasks.map((t:any)=>[t.id,t.status]))
+        for(const t of data.tasks){
+          if(t.kind!=='refresh_assets'&&t.kind!=='recover_images')continue
+          const status=previous.get(t.id)
+          if((!status&&t.kind!=='recover_images')||status===t.status)continue
+          if(t.status==='failed')report(new Error(t.detail))
+          if(t.status!=='completed')continue
+          if(t.kind==='refresh_assets'){
+            toast.success('表情包和朋友圈快照已更新')
+          }else{
+            toast.success('图片读取已恢复',{description:t.detail})
+            window.dispatchEvent(new Event('moect-media-recovered'))
+          }
+        }
+      }
     }catch(error){if(epoch===libraryEpoch.current)report(error)}finally{refreshing.current=false}
   },[load,update])
   useEffect(()=>{
@@ -181,10 +213,26 @@ export function App(){
     if(stateRef.current?.image_recovery_skip_help)void startImageRecovery()
     else setImageRecoveryHelpOpen(true)
   }
+  const hideAssetHelp=async(preference:'moments_timeline_help_hidden'|'favorites_help_hidden')=>{
+    const saved=await call('settings',{[preference]:true})
+    update({...stateRef.current,[preference]:saved[preference]})
+  }
   const logout=async()=>{changingLibrary.current=true;libraryEpoch.current++;try{const data=await call('logout');resetSessionView();update(data);setDetected(null);setAccount('');setConnectError('');setConnectOpen(false);setTab('overview');toast.success('已退出登录',{description:'任务记录和已导出的文件已保留。'})}catch(e){report(e)}finally{changingLibrary.current=false}}
   const toggle=(type:string,id:string)=>setSelected(prev=>{const result=new Set(prev),key=`${type}_${id}`;result.has(key)?result.delete(key):result.add(key);return result})
   const selectMany=(ids:Set<string>,mode:'add'|'remove')=>setSelected(prev=>{const result=new Set(prev);ids.forEach(id=>mode==='add'?result.add(id):result.delete(id));return result})
-  const exportChats=async(config:BatchExportConfig)=>{try{let start='',end='';if(config.timeRange==='recent'){const d=new Date();d.setMonth(d.getMonth()-3);start=d.toISOString().slice(0,10)}if(config.timeRange==='custom'){start=config.customStartDate||'';end=config.customEndDate||''}await call('export',{sessions:exportItems.map(i=>i.id),format:config.format.toLowerCase(),start,end,query:config.keywords,includeSystemMessages:config.includeSystemMessages,quickExport:config.quickExport,includeAvatars:config.includeAvatars,allowRemoteMedia:config.allowRemoteMedia,skipDownloadResourceTypes:config.skipDownloadResourceTypes||[],archiveZip:config.archiveZip,archiveEncrypt:config.archiveEncrypt,archivePassword:config.archivePassword});setExportOpen(false);setTab('tasks');await refresh()}catch(e){report(e);throw e}}
+  const exportChats=async(config:BatchExportConfig)=>{
+    try{
+      await call('export',{
+        sessions:exportItems.map(i=>i.id),format:config.format.toLowerCase(),timeRange:config.timeRange,
+        start:config.customStartDate||'',end:config.customEndDate||'',query:config.keywords,
+        includeSystemMessages:config.includeSystemMessages,quickExport:config.quickExport,
+        includeAvatars:config.includeAvatars,allowRemoteMedia:config.allowRemoteMedia,
+        skipDownloadResourceTypes:config.skipDownloadResourceTypes||[],archiveZip:config.archiveZip,
+        archiveEncrypt:config.archiveEncrypt,archivePassword:config.archivePassword,
+      })
+      setExportOpen(false);setTab('tasks');await refresh()
+    }catch(e){report(e);throw e}
+  }
   const theme=async(event:MouseEvent<HTMLButtonElement>)=>{
     if(appearanceBusy.current)return
     appearanceBusy.current=true;setChangingAppearance(true)
@@ -206,7 +254,7 @@ export function App(){
   const tasks=state.tasks,exports=tasks.filter((t:any)=>t.kind==='export'),stats={total:exports.length,running:exports.filter((t:any)=>active(t.status)).length,completed:exports.filter((t:any)=>t.status==='completed').length}
   const overviewStats=state.library?stats:{total:0,running:0,completed:0}
   const connectBusy=connecting||tasks.some((t:any)=>t.kind==='connect'&&active(t.status))
-  const nav=[{id:'overview',label:'概览',icon:Activity},{id:'sessions',label:'会话',icon:MessageCircle},{id:'tasks',label:'任务',icon:Zap},{id:'stickers',label:'表情包',icon:Sticker},{id:'moments',label:'朋友圈',icon:Images},{id:'favorites',label:'收藏（测试）',icon:Bookmark}]
+  const nav=[{id:'overview',label:'概览',icon:Activity},{id:'sessions',label:'会话',icon:MessageCircle},{id:'tasks',label:'任务',icon:Zap},{id:'stickers',label:'表情包',icon:Sticker},{id:'moments',label:'朋友圈',icon:Images},{id:'favorites',label:'收藏',icon:Bookmark}]
   const bottom=[{id:'settings',label:'设置',icon:Settings},{id:'about',label:'关于',icon:HelpCircle}]
   const navButton=(item:any)=>{const Icon=item.icon;return <motion.button key={item.id} id={`nav-${item.id}`} onClick={()=>setTab(item.id)} className={`w-full flex items-center gap-2.5 px-2 py-[6px] text-[14px] font-medium rounded-lg transition-colors ${tab===item.id?'text-primary bg-primary/10':'text-muted-foreground hover:text-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'}`}><Icon className="w-[18px] h-[18px] flex-shrink-0"/><span className="truncate">{item.label}</span>{item.id==='tasks'&&stats.running>0&&<Loader size={12} className="ml-auto text-blue-600"/>}</motion.button>}
   const deleteTask=(t:any)=>toast.info('删除这条任务记录？',{description:t.title+' · 导出的文件仍会保留',duration:Infinity,action:{label:'删除记录',onClick:()=>nativeAction('delete_task',{id:t.id})}})
@@ -214,8 +262,8 @@ export function App(){
   return <TooltipProvider><div className="flex h-screen w-full bg-background font-sans overflow-hidden"><AnimatePresence initial={false}>{sidebar&&<motion.div initial={{width:0,opacity:0}} animate={{width:208,opacity:1}} exit={{width:0,opacity:0}} className="h-full flex flex-col flex-shrink-0 overflow-hidden select-none relative"><div className="w-[208px] h-full flex flex-col"><button onClick={openConnect} className="flex items-center px-4 h-14 flex-shrink-0 text-left"><div className="flex items-center gap-2.5 min-w-0"><Avatar className="w-7 h-7 flex-shrink-0 rounded-full">{state.library?.profile?.avatar_url&&<AvatarImage src={state.library.profile.avatar_url}/>}<AvatarFallback className="text-[11px] rounded-full">{state.library?.profile?.name?.[0]||<img src="./icon.svg" className="w-full h-full" alt="Moect"/>}</AvatarFallback></Avatar><span className="text-[14px] font-semibold text-foreground truncate">{state.library?.name||'Moect'}</span></div></button><div className="flex-1 overflow-y-auto px-2 py-1"><div className="space-y-0.5">{nav.map(navButton)}</div><div className="mt-4 mb-1 px-2"><span className="text-[12px] font-medium text-muted-foreground/60 uppercase tracking-wider">系统</span></div><div className="space-y-0.5">{bottom.map(navButton)}</div></div><div className="sidebar-footer flex-shrink-0 pb-2 space-y-1"><div className="sidebar-links" role="group" aria-label="项目链接"><button type="button" onClick={()=>nativeAction('source',{name:'project'})} title="打开 GitHub 仓库"><span>GitHub</span></button><button type="button" onClick={()=>nativeAction('source',{name:'website'})} title="打开 Moect 官网"><span>Moect</span></button></div><div className="sidebar-actions" role="group" aria-label="更新、公告与外观"><div id="sidebar-online"/><button onClick={theme} disabled={changingAppearance} aria-busy={changingAppearance} title="切换亮暗" className="sidebar-theme-shortcut inline-flex h-9 w-9 items-center justify-center rounded-full bg-transparent hover:bg-accent transition-colors"><ThemeToggleIcon dark={state.theme==='dark'}/></button></div></div></div></motion.div>}</AnimatePresence><div className="flex-1 flex flex-col overflow-hidden sm:m-2 sm:rounded-xl sm:border sm:border-black/[0.05] sm:shadow-[0_2px_8px_rgba(0,0,0,0.015)] bg-card dark:border-white/[0.06]"><div className="flex flex-shrink-0 items-center justify-between border-b border-black/[0.06] dark:border-white/[0.06] px-4 h-12"><div className="flex items-center gap-2 text-[14px]"><button onClick={()=>setSidebar(!sidebar)} aria-label="切换侧栏" className="p-1 -ml-1 rounded-full text-muted-foreground/60 hover:text-muted-foreground hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors">{sidebar?<PanelLeftClose className="w-4 h-4"/>:<PanelLeftOpen className="w-4 h-4"/>}</button><span className="font-medium text-muted-foreground">Moect</span><span className="text-muted-foreground/30">/</span><span className="font-semibold text-foreground">{titles[tab]}</span></div><WindowDragRegion/><div className="flex items-center gap-2">{state.library?.demo&&<Badge variant="secondary" className="text-xs rounded-full">演示数据</Badge>}{tab==='sessions'&&<><Button size="sm" variant="ghost" className="h-8 text-[13px] rounded-full px-2.5" disabled={!state.library?.live||startingImageRecovery||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))} onClick={requestImageRecovery}>恢复图片读取</Button><Button size="sm" variant="ghost" className="h-8 text-[13px] rounded-full px-2" onClick={()=>void reconnect()} title="重新连接并整理微信" disabled={connecting||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))||loading||!state.library}>{loading?<Loader size={16}/>:<RefreshCw className="w-4 h-4"/>}</Button><Button size="sm" variant="ghost" className="h-8 text-[13px] rounded-full px-2.5" onClick={()=>{setBatch(!batch);setSelected(new Set())}}>批量选择</Button></>}{tab==='tasks'&&<Button size="sm" className="h-8 text-[13px] rounded-full px-2.5" onClick={()=>setTab('sessions')}>新建任务</Button>}<Button size="sm" variant="ghost" className="h-8 text-[13px] rounded-full px-2.5" onClick={openConnect}>连接微信</Button><WindowControls/></div></div><div className="flex-1 overflow-auto">
   {tab==='overview'&&<div className="p-6 space-y-6"><div className="flex items-center gap-4"><Avatar className="w-12 h-12 rounded-full">{state.library?.profile?.avatar_url&&<AvatarImage src={state.library.profile.avatar_url}/>}<AvatarFallback className="rounded-full text-sm">{state.library?.profile?.name?.[0]||<img src="./icon.svg" className="w-full h-full" alt="Moect"/>}</AvatarFallback></Avatar><div><h2 className="text-lg font-semibold text-foreground">{state.library?.name||'Moect'}</h2><div className="flex items-center gap-2 mt-0.5 text-sm text-muted-foreground"><span>{state.library?(state.library.demo?'演示归档 · 虚构数据':`微信 ${state.library.profile?.alias||state.library.profile?.wxid||'本地归档'}`):'本地模式 · 尚未连接微信'}</span></div></div></div><div className="grid grid-cols-3 gap-4"><div className="rounded-xl p-4"><div className="text-sm text-muted-foreground">导出任务</div><div className="text-2xl font-semibold tracking-tight mt-1">{overviewStats.total}</div><div className="text-xs text-muted-foreground/60 mt-1">进行中 {overviewStats.running} · 完成 {overviewStats.completed}</div></div><div className="rounded-xl p-4"><div className="text-sm text-muted-foreground">群组</div><div className="text-2xl font-semibold tracking-tight mt-1">{groups.length}</div></div><div className="rounded-xl p-4"><div className="text-sm text-muted-foreground">好友</div><div className="text-2xl font-semibold tracking-tight mt-1">{friends.filter(friend=>!friend.sessionCategory||friend.sessionCategory==='friend').length}</div></div></div><div className="flex items-center gap-3"><Button onClick={()=>state.library?setTab('sessions'):openConnect()} className="rounded-full">{state.library?'新建任务':'连接微信'}</Button><Button variant="outline" onClick={()=>setTab('sessions')} className="rounded-full">浏览会话</Button><Button variant="outline" onClick={()=>setTab('tasks')} className="rounded-full">查看任务</Button></div>{!state.library&&<div className="rounded-xl bg-card p-6 space-y-4"><div className="space-y-1.5"><h3 className="text-[15px] font-semibold">连接微信，开始导出</h3><p className="text-[13px] text-muted-foreground/80 leading-relaxed">保持电脑微信登录，然后点击“连接微信”。也可以打开已有的解密备份，或体验演示数据。</p></div><Button variant="outline" className="rounded-full" onClick={demo}>体验演示</Button></div>}{state.library&&exports.length>0&&<div><div className="flex items-center justify-between mb-3"><h3 className="text-sm font-medium">最近任务</h3><button onClick={()=>setTab('tasks')} className="text-sm text-muted-foreground hover:text-foreground">查看全部</button></div><div className="rounded-xl divide-y divide-black/[0.04] dark:divide-white/[0.04] overflow-hidden">{exports.slice(0,5).map((t:any)=>taskRow(t,true))}</div></div>}</div>}
   {tab==='sessions'&&<div className="px-4 pt-2 pb-5 space-y-2">{state.library?<SessionList sortPreference={state.session_sort} onSortPreferenceChange={saveSessionSort} groups={groups} friends={friends} batchMode={batch} selectedItems={selected} recentActivityMap={recent} onToggleBatchMode={()=>setBatch(!batch)} onToggleItem={toggle} onSelectMany={selectMany} onSelectAll={ids=>selectMany(ids||new Set(sessions.map(s=>(s.is_group?'group_':'friend_')+s.username)),'add')} onClearSelection={()=>setSelected(new Set())} onOpenBatchExportDialog={getBatch} canRestoreLastExport={state.last_export_available && sessions.length>0} onRestoreLastExport={restoreLastExport} onOpenTaskWizard={preset=>chooseItems([preset.peerUid])} onPreviewChat={(type,id,name,peer)=>{setPreview({type,id,name,peer});setPreviewOpen(true)}}/>:<div className="rounded-xl bg-card p-6 space-y-4"><h3 className="text-[15px] font-semibold">尚未连接微信归档</h3><p className="text-[13px] text-muted-foreground/80 leading-relaxed">连接已登录的微信，或打开已有的解密备份。</p><div className="flex gap-2"><Button onClick={openConnect} className="rounded-full">连接微信</Button><Button onClick={importArchive} variant="outline" className="rounded-full">打开备份</Button><Button onClick={demo} variant="ghost" className="rounded-full">演示模式</Button></div></div>}</div>}
-  {onboarding.checked&&!onboarding.open&&(tab==='stickers'||tab==='moments')&&<AccountAssetsPage key={tab} kind={tab} library={state.library} busy={startingImageRecovery||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))} onConnect={openConnect} onExportQueued={()=>{setTab('tasks');void refresh()}} onRefreshQueued={()=>void refresh()} onTutorialChange={setAssetOverlayOpen} onRecoverImages={requestImageRecovery}/>}
-  {onboarding.checked&&!onboarding.open&&tab==='favorites'&&<FavoritesPage library={state.library} busy={startingImageRecovery||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))} onConnect={openConnect} onExportQueued={()=>{setTab('tasks');void refresh()}} onRefreshQueued={()=>void refresh()} onOverlayChange={setAssetOverlayOpen} onRecoverImages={requestImageRecovery}/>}
+  {onboarding.checked&&!onboarding.open&&(tab==='stickers'||tab==='moments')&&<AccountAssetsPage key={tab} kind={tab} library={state.library} busy={startingImageRecovery||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))} timelineHelpHidden={state.moments_timeline_help_hidden} onHideTimelineHelp={()=>hideAssetHelp('moments_timeline_help_hidden')} onConnect={openConnect} onExportQueued={()=>{setTab('tasks');void refresh()}} onRefreshQueued={()=>void refresh()} onTutorialChange={setAssetOverlayOpen} onRecoverImages={requestImageRecovery}/>}
+  {onboarding.checked&&!onboarding.open&&tab==='favorites'&&<FavoritesPage library={state.library} busy={startingImageRecovery||tasks.some((t:any)=>['connect','refresh_assets','recover_images'].includes(t.kind)&&active(t.status))} helpHidden={state.favorites_help_hidden} onHideHelp={()=>hideAssetHelp('favorites_help_hidden')} onConnect={openConnect} onExportQueued={()=>{setTab('tasks');void refresh()}} onRefreshQueued={()=>void refresh()} onOverlayChange={setAssetOverlayOpen} onRecoverImages={requestImageRecovery}/>}
   {tab==='tasks'&&<TasksPage tasks={tasks} onAction={(action,id)=>void nativeAction(action,{id})} onDelete={deleteTask} onChanged={update}/>}
   {tab==='settings'&&<SettingsPage state={state} changingAppearance={changingAppearance} onTheme={theme} onAccent={accent} onAction={action=>void nativeAction(action)} onConnect={openConnect} onImport={importArchive} onDemo={demo} onTutorial={onboarding.show} onStorageChanged={async()=>{const next=await call('state');update(next);if(!next.library)resetSessionView();else if(!next.storage_busy)await load()}} onError={report}/> }
   {tab==='about'&&<AboutPage version={state.version} onSource={name=>void nativeAction('source',{name})}/> }
@@ -223,7 +271,7 @@ export function App(){
   {(previewOpen||exportOpen)&&<div className="fixed top-0 left-0 right-0 h-12 z-[200] bg-background flex items-center pr-4"><WindowDragRegion/><WindowControls/></div>}
   {previewOpen&&<MessagePreviewModal open={previewOpen} onClose={()=>setPreviewOpen(false)} chat={preview} onRefresh={()=>reconnect(true)} refreshing={connectBusy} revision={state.library?.data_revision} onExport={()=>{if(preview)chooseItems([preview.id])}}/>}
   <BatchExportDialog open={exportOpen} onOpenChange={setExportOpen} items={exportItems} onExport={exportChats}/>
-  <Dialog open={connectOpen} onOpenChange={setConnectOpen}><DialogContent className="p-8 max-w-lg">
+  <Dialog open={connectOpen} onOpenChange={setConnectOpen}><DialogContent frosted className="p-8 max-w-lg">
     <DialogTitle className="text-lg font-semibold mb-2">连接微信</DialogTitle>
     <p className="text-[13px] text-muted-foreground mb-6 leading-relaxed">保持电脑微信已登录，软件会自动获取读取凭据、整理快照并载入会话。</p>
     {!detected&&!connectError?<div className="flex justify-center py-8"><Loader size={20}/></div>:<div className="space-y-4">

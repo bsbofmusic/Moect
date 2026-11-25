@@ -9,11 +9,11 @@ import threading
 import time
 import uuid
 import base64
-import psutil
+from calendar import monthrange
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -29,7 +29,9 @@ from .export_options import export_preferences,is_system_message
 from .themes import ACCENT_IDS,palette,accent_choices
 from .archive_packaging import archive_files, public_options, update_options, export_options, package_folder, folder_sizes
 from .diagnostics import ConnectionProblem, environment
+from .streaming import run_export_workers
 from . import storage
+from wx4 import WECHAT_TIME_ZONE
 from wx4.forward import build_forward
 
 SORT_FIELDS=('frequentExport','name','memberCount','id','lastActivity','exportedCount')
@@ -87,13 +89,18 @@ def options_from(payload):
     result.update(export_preferences(payload))
     if result['kind'] not in ('all','text','image','voice','video','file','link','system'):
         raise ValueError('消息类型不受支持')
-    for key, tail in [('start', 'T00:00:00'), ('end', 'T23:59:59')]:
-        value = payload.get(key)
+    start = payload.get('start')
+    if payload.get('timeRange') == 'recent':
+        today = datetime.now(WECHAT_TIME_ZONE).date()
+        year, month = divmod(today.year * 12 + today.month - 1 - 3, 12)
+        month += 1
+        start = today.replace(year=year, month=month, day=min(today.day, monthrange(year, month)[1])).isoformat()
+    for key, value, tail in [('start', start, 'T00:00:00'), ('end', payload.get('end'), 'T23:59:59')]:
         if value:
             value=str(value)
             normalized=value[:16]+(':00' if key=='start' else ':59') if 'T' in value else value[:10]+tail
             result[key] = int(datetime.fromisoformat(normalized).replace(
-                tzinfo=timezone(timedelta(hours=8))).timestamp())
+                tzinfo=WECHAT_TIME_ZONE).timestamp())
     if result.get('start', 0) > result.get('end', 10**12):
         raise ValueError('开始日期不能晚于结束日期')
     return result
@@ -181,6 +188,8 @@ class Service:
         if not isinstance(self.config.get('accent'),str) or self.config['accent'] not in ACCENT_IDS:self.config['accent']='violet'
         self.config['image_recovery_skip_help']=self.config.get('image_recovery_skip_help') is True
         self.config['storage_limit_help_hidden']=self.config.get('storage_limit_help_hidden') is True
+        self.config['moments_timeline_help_hidden']=self.config.get('moments_timeline_help_hidden') is True
+        self.config['favorites_help_hidden']=self.config.get('favorites_help_hidden') is True
         seen=self.config.get('tutorials_seen')
         self.config['tutorials_seen']={kind:seen.get(kind,'') if isinstance(seen,dict) and isinstance(seen.get(kind),str) else ''
                                       for kind in ('app','moments','stickers','favorites')}
@@ -288,6 +297,8 @@ class Service:
                     'storage_dir':str(self.storage_root),'storage_warning':self.storage_warning,'storage_busy':self._maintenance,
                     'storage_limit_gb':self.config['storage_limit_gb'],
                     'storage_limit_help_hidden':self.config['storage_limit_help_hidden'],
+                    'moments_timeline_help_hidden':self.config['moments_timeline_help_hidden'],
+                    'favorites_help_hidden':self.config['favorites_help_hidden'],
                     'library':dict(name=lib.get('profile',{}).get('name') or lib['name'],
                                    profile=lib.get('profile',{}),demo=lib.get('demo', False),
                                    live=bool(lib.get('account_dir')),assets_revision=lib.get('assets_revision',''),
@@ -384,41 +395,7 @@ class Service:
                 raise ValueError('软件正在退出或任务队列暂不可用，请重新打开后重试。') from error
 
     def _run_export_batch(self, count, export_one, check, on_wait):
-        """Yield completed sessions while keeping a bounded worker queue."""
-        cores = psutil.cpu_count(logical=False) or os.cpu_count() or 1
-        limit = 1 if cores <= 1 else min(4, max(2, cores // 2))
-        active = set()
-        next_session = 0
-        cpu = psutil.cpu_percent(interval=0.15)
-        measured = time.monotonic()
-        with ThreadPoolExecutor(max_workers=limit, thread_name_prefix='session-export') as exports:
-            while next_session < count or active:
-                check()
-                if active:
-                    should_wait = len(active) >= limit or next_session >= count
-                    done, active = wait(active, timeout=0.4 if should_wait else 0, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        yield future.result()
-                if len(active) >= limit or next_session >= count:
-                    continue
-                now = time.monotonic()
-                if now - measured >= 0.4:
-                    cpu = psutil.cpu_percent()
-                    measured = now
-                memory = psutil.virtual_memory()
-                reserve = min(768 * 1024**2, memory.total // 8)
-                need = reserve + len(active) * 512 * 1024**2
-                if memory.available < need or (active and cpu >= 85):
-                    on_wait()
-                    if active:
-                        done, active = wait(active, timeout=0.4, return_when=FIRST_COMPLETED)
-                        for future in done:
-                            yield future.result()
-                    else:
-                        time.sleep(0.4)
-                    continue
-                active.add(exports.submit(export_one, next_session))
-                next_session += 1
+        return run_export_workers(range(count), export_one, check, on_wait)
 
     def _update(self, job, **values):
         with self.lock:
@@ -1236,11 +1213,13 @@ class Service:
                 archive=self.archive(library)
                 def progress(count,total):
                     self._check(job)
-                    self._update(job,count=count,progress=min(95,int(count*95/total)) if total else 20,
+                    percent=5+83*count//total if total else 5
+                    self._update(job,count=count,progress=max(job['progress'],min(88,percent)),
                                  detail='正在导出%s · %s%s'%(label,count,('/'+str(total)) if total else ''))
                 exporter={'stickers':export_stickers,'moments':export_moments,'favorites':export_favorites}[kind]
                 result=exporter(archive,library,options,staging,self.assets,progress,lambda:self._check(job),lambda msg:self._update(job,detail=msg))
                 self._check(job)
+                self._update(job,progress=92,detail='正在整理导出文件…')
                 folder,sizes=self._finish_export_files(job,result,staging,output,folder_name,packaging,password,source_bytes)
                 self._update(job,folder=str(folder),files=[result],count=result['count'],resource_summary=result['resource_summary'],
                              size_info=sizes,compressed=bool(packaging.get('zip')),encrypted=bool(packaging.get('encrypt')),
@@ -1283,11 +1262,11 @@ class Service:
         return {'deleted':len(removed),'state':self.state()}
 
     def task_file(self,job_id):
-        folder=self.task_folder(job_id)
         with self.lock:
+            folder=self.task_folder(job_id)
             task=next(t for t in self.config['tasks'] if t['id']==job_id)
             files=task.get('files') or []
-            path=Path(files[0]['path']).resolve() if len(files)==1 else folder/'index.html'
+            path=(Path(files[0]['path']) if len(files)==1 else folder/'index.html').resolve()
             if path.is_relative_to(folder) and path.is_file():return path
         raise ValueError('导出文件不存在')
 
@@ -1307,6 +1286,10 @@ class Service:
             raise ValueError('缓存说明显示选项无效')
         if 'image_recovery_skip_help' in payload and not isinstance(payload['image_recovery_skip_help'],bool):
             raise ValueError('图片恢复提示选项无效')
+        if 'moments_timeline_help_hidden' in payload and not isinstance(payload['moments_timeline_help_hidden'],bool):
+            raise ValueError('公共朋友圈说明显示选项无效')
+        if 'favorites_help_hidden' in payload and not isinstance(payload['favorites_help_hidden'],bool):
+            raise ValueError('收藏说明显示选项无效')
         with self.lock:
             theme=payload.get('theme');accent=payload.get('accent')
             if accent is not None and (not isinstance(accent,str) or accent not in ACCENT_IDS):raise ValueError('主题色不受支持')
@@ -1317,6 +1300,8 @@ class Service:
             if 'image_recovery_skip_help' in payload:self.config['image_recovery_skip_help']=payload['image_recovery_skip_help']
             if 'storage_limit_gb' in payload:self.config['storage_limit_gb']=payload['storage_limit_gb']
             if 'storage_limit_help_hidden' in payload:self.config['storage_limit_help_hidden']=payload['storage_limit_help_hidden']
+            if 'moments_timeline_help_hidden' in payload:self.config['moments_timeline_help_hidden']=payload['moments_timeline_help_hidden']
+            if 'favorites_help_hidden' in payload:self.config['favorites_help_hidden']=payload['favorites_help_hidden']
             try:
                 self.save()
             except BaseException:

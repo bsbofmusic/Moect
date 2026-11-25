@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
+@import '../../ui/glass.css';
 
 @custom-variant dark (&:is(.dark *));
 
@@ -181,15 +182,89 @@ html.qce-inter body {
   }
 }
 
-@keyframes dropdown-in {
-  from { opacity: 0; transform: translateY(-8px) scale(0.96); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
 @keyframes dropdown-out {
   from { opacity: 1; transform: translateY(0) scale(1); }
   to { opacity: 0; transform: translateY(-6px) scale(0.96); }
 }
+
+.task-resource-popover {
+  --frosted-density: 57%;
+  --frosted-blur: 4px;
+}
+
+.dark .task-resource-popover {
+  --frosted-density: 66%;
+}
+
+.selection-checkbox {
+  display: inline-flex;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: inherit;
+  cursor: pointer;
+}
+
+.selection-checkbox-labeled { width: auto; }
+.selection-checkbox:disabled { opacity: 0.43; cursor: default; }
+
+.selection-checkbox-mark {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--primary-foreground);
+  transition: background-color 140ms, border-color 140ms, transform 140ms;
+}
+
+.selection-checkbox-mark svg { opacity: 0; transform: scale(0.7); transition: opacity 140ms, transform 140ms; }
+.selection-checkbox:hover:not(:disabled) .selection-checkbox-mark { border-color: var(--primary); }
+.selection-checkbox:active:not(:disabled) .selection-checkbox-mark { transform: scale(0.9); }
+.selection-checkbox[aria-checked="true"] .selection-checkbox-mark { background: var(--primary); border-color: var(--primary); }
+.selection-checkbox[aria-checked="true"] .selection-checkbox-mark svg { opacity: 1; transform: none; }
+.selection-checkbox:focus-visible { outline: none; }
+.selection-checkbox:focus-visible .selection-checkbox-mark { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .selection-checkbox-mark, .selection-checkbox-mark svg { transition: none; }
+}
+
+.export-date-segment moect-date-range::part(trigger),
+.export-date-segment moect-date-range::part(trigger):hover {
+  height: 30px;
+  padding: 0 20px;
+  border: 0;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--muted-foreground);
+}
+.export-date-segment moect-date-range::part(trigger):hover {
+  color: var(--foreground);
+}
+.export-date-segment moect-date-range[pressed="true"]::part(trigger) {
+  background-color: #fff;
+  color: var(--foreground);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+.dark .export-date-segment moect-date-range[pressed="true"]::part(trigger) {
+  background-color: rgb(255 255 255 / 10%);
+}
+.export-date-segment moect-date-range::part(trigger-chevron) {
+  display: none;
+}
+
+.batch-selection-surface {
+  --frosted-density: 54%;
+  --frosted-blur: 6px;
+}
+
+.dark .batch-selection-surface { --frosted-density: 63%; }
 
 .about-page{min-height:100%;display:flex;flex-direction:column}.about-signature{margin-top:auto;flex-shrink:0;padding:24px 24px 20px;text-align:center}.about-signature button{font-size:11px;color:var(--muted-foreground);opacity:.65;transition:opacity .2s,color .2s}.about-signature button:hover{opacity:1;color:var(--primary)}
 
@@ -217,10 +292,17 @@ html.qce-inter body {
 .storage-limit input[type=range]::-moz-range-thumb{width:16px;height:16px;border:0;border-radius:50%;background:var(--primary)}
 .storage-limit input[type=range]:focus-visible{outline:2px solid var(--primary);outline-offset:4px;border-radius:8px}
 .storage-limit-labels{display:flex;justify-content:space-between;color:var(--muted-foreground);font-size:11px;gap:4px}
-.about-content{flex:1}.about-grid p{font-size:13px;line-height:1.8;color:var(--muted-foreground);max-width:76ch;overflow-wrap:anywhere}
-.about-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.about-content{flex:1}
+.about-grid p{font-size:13px;line-height:1.8;color:var(--muted-foreground);overflow-wrap:anywhere}
+.about-links{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,160px),1fr));gap:10px}
+@container (min-width:640px){
+  .about-grid{grid-template-columns:repeat(6,minmax(0,1fr))}
+  .about-grid > section{grid-column:span 3}
+  .about-grid > .about-intro{grid-column:span 4}
+  .about-grid > .about-projects{grid-column:span 2}
+}
 .asset-page{width:100%;min-width:0}.asset-heading{flex-wrap:wrap}.sticker-category-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,235px),1fr));gap:12px}
 .moments-preview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:16px;align-items:start}
-@container(min-width:800px){.settings-grid,.about-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@container(min-width:800px){.settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @container(min-width:560px){.accent-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.storage-summary{grid-template-columns:minmax(90px,.6fr) minmax(0,1.4fr)}}
 @media(max-width:640px){.page-shell{padding:18px 16px}.settings-card{padding:18px 16px;border-radius:16px}.settings-card-heading{gap:8px}.storage-summary{grid-template-columns:1fr}}

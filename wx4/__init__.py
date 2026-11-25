@@ -15,4 +15,7 @@ wx4 —— PC 微信 4.x (Weixin.exe) 聊天记录导出适配层
 
 本包用微信 4.x 的方式重新实现「取密钥 -> 解密 -> 读取 -> 导出」全链路。
 """
+from datetime import timedelta, timezone
+
 __version__ = "4.0.0"
+WECHAT_TIME_ZONE = timezone(timedelta(hours=8), 'Asia/Shanghai')

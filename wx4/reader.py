@@ -22,6 +22,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from decimal import Decimal,InvalidOperation
+from . import WECHAT_TIME_ZONE
 from .game_emojis import describe_game
 
 try:
@@ -595,7 +596,8 @@ class Wx4Data:
         content = decode_content(r["message_content"], r["compress_content"])
         sender = id2name.get(r["real_sender_id"], "")
         try:
-            time_str = datetime.fromtimestamp(r['create_time']).strftime('%Y-%m-%d %H:%M:%S') if r['create_time'] else ''
+            time_str = (datetime.fromtimestamp(r['create_time'], WECHAT_TIME_ZONE).strftime('%Y-%m-%d %H:%M:%S')
+                        if r['create_time'] else '')
         except (ValueError, OverflowError, OSError, TypeError):
             time_str = ''
         # A group wire body begins with the sender's actual username, which

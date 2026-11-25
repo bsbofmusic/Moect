@@ -256,6 +256,8 @@ def moment_from_row(row,owner=None):
     location=tag(timeline,'location')
     if location is not None:result['location']=location.get('poiName') or location.get('poiAddress') or location.get('city') or ''
     media_list=tag(content,'mediaList')
+    shared_keys=[key for node in timeline.iter() if node.tag.rsplit('}',1)[-1].lower()=='enc'
+                 if re.fullmatch(r'[0-9]{1,20}',key:=node.get('key',''))] if media_list is not None else []
     for media in list(media_list)[:100] if media_list is not None else []:
         if media.tag.rsplit('}',1)[-1].lower()!='media':continue
         url_node=tag(media,'url');thumb_node=tag(media,'thumb')
@@ -268,10 +270,7 @@ def moment_from_row(row,owner=None):
                     hashes.append(value.lower());(thumbnail_hashes if node is thumb_node else main_hashes).append(value.lower())
                 if name.lower() in ('key','aeskey','aes_key') and value:keys.append(value)
                 if name.lower()=='key' and re.fullmatch(r'[0-9]{1,20}',value):stream_keys.append(value)
-        for node in timeline.iter():
-            if node.tag.rsplit('}',1)[-1].lower()=='enc':
-                value=node.get('key','')
-                if re.fullmatch(r'[0-9]{1,20}',value):stream_keys.append(value)
+        stream_keys.extend(shared_keys)
         for value in (media_id,):
             if HASH.fullmatch(value):hashes.append(value.lower());main_hashes.append(value.lower())
         for value,group in ((url,main_hashes),(thumb,thumbnail_hashes)):

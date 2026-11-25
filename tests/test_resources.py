@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import re
 import sqlite3
 import struct
 import tempfile
@@ -9,9 +10,10 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote
 from Cryptodome.Cipher import AES
 from core.data import Archive
-from core.exporting import export_session
+from core.exporting import export_session, readable_text
 from core.service import Service
 from wx4.media import SIG_V1,SIG_V2,V1_KEY,decode_dat
 from wx4.reader import reference_text
@@ -101,6 +103,25 @@ class ResourceTests(unittest.TestCase):
                 rows=json.loads(path.read_text(encoding='utf-8'))['messages']
                 for m in rows:
                     for r in m['resources']:self.assertTrue((out/r['path']).is_file())
+
+    def test_markdown_links_to_existing_media_and_renders_chat_text_literally(self):
+        out = self.root/'markdown'
+        out.mkdir()
+        session = dict(self.archive.sessions()[0], display='分享 #1 (备份%)')
+        result = export_session(self.archive, session, {'format': 'md'}, out, ASSETS, lambda _: None, lambda: None)
+        content = Path(result['path']).read_text(encoding='utf-8')
+        link = re.search(r'!\[图片\]\(<([^>]+)>\)', content)[1]
+        self.assertIn('%23', link)
+        self.assertIn('%25', link)
+        self.assertEqual((out/unquote(link)).read_bytes(), PNG)
+        self.assertIn('https://example.com/article?a=1&b=2>', content)
+        sample = dict(kind='text', text='- 条目\r1. 排序\r\n<aside> **加粗** &copy;')
+        self.assertEqual(readable_text(sample, markdown=True),
+                         r'\- 条目' + '  \n' + r'1\. 排序' + '  \n' + r'\<aside\> \*\*加粗\*\* \&copy;')
+        indented = dict(kind='text', text='示例\n\n    print(`value`)\n\t# 保留缩进')
+        self.assertEqual(readable_text(indented, markdown=True),
+                         '示例  \n  \n' + '&#160;' * 4 + r'print(\`value\`)' + '  \n'
+                         + '&#160;' * 4 + r'\# 保留缩进')
 
     def test_batch_workers_reuse_account_indexes_and_keep_scoped_matches(self):
         from concurrent.futures import ThreadPoolExecutor

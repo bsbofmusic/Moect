@@ -20,6 +20,10 @@ from wx4.media import (SIG_V1,SIG_V2,V1_KEY,dat_layout,decode_dat,
                        image_prefix,infer_xor_key,find_dat_aes_key,decrypt_dat_prefix,read_dat_key_probe)
 
 _image_key_cache_lock = threading.Lock()
+SILK_HEADER = b'#!SILK_V3'
+TENCENT_SILK_HEADER = b'\x02' + SILK_HEADER
+SILK_SAMPLE_RATE = 24000
+MAX_SILK_PCM_BYTES = 144 * 1024 * 1024
 
 
 def is_flac_message(message):
@@ -367,9 +371,10 @@ class ImageKeys:
 
 def silk_stream(blob, cancel):
     """Normalize complete SILK packets before passing them to the native SDK."""
-    raw = blob[1:] if blob.startswith(b'\x02#!SILK_V3') else blob
-    if not raw.startswith(b'#!SILK_V3'):
+    raw = blob[1:] if blob.startswith(TENCENT_SILK_HEADER) else blob
+    if not raw.startswith(SILK_HEADER):
         raise ValueError('Missing SILK header')
+    zero_tail = len(raw.rstrip(b'\0'))
     starts = [9]
     if raw[9:11] == b'\r\n':
         starts.append(11)
@@ -378,41 +383,53 @@ def silk_stream(blob, cancel):
     for start in starts:
         offset = start
         packets = 0
+        has_payload = False
+        has_loss = False
+        leading_loss = 0
         last_packet = b''
         valid = True
         while offset < len(raw):
             cancel()
+            # After a complete payload, a short all-zero tail is alignment
+            # padding. An interior zero-length packet represents packet loss.
+            if has_payload and offset >= zero_tail:
+                valid = len(raw) - offset <= 256
+                break
             if offset + 2 > len(raw):
                 valid = False
                 break
             length = struct.unpack_from('<h', raw, offset)[0]
             offset += 2
-            if length == -1 and offset == len(raw):
+            # The SILK end marker also terminates files with a cache trailer.
+            if length == -1:
                 offset -= 2
                 break
-            # Some old WeChat clips have zero-filled alignment bytes after the
-            # last complete frame. Only accept a short and wholly zero tail.
-            if length == 0 and packets and len(raw) - offset <= 254 and (len(raw) - offset) % 2 == 0 and not any(raw[offset:]):
-                offset -= 2
-                break
-            # pysilk's SDK has a 1250-byte per-packet buffer.
-            if not 0 < length <= 1250 or offset + length > len(raw):
+            if not 0 <= length <= 1250 or offset + length > len(raw):
                 valid = False
                 break
+            if length:
+                has_payload = True
+            elif has_payload:
+                has_loss = True
+            else:
+                leading_loss += 1
             last_packet = raw[offset - 2:offset + length]
             offset += length
             packets += 1
             if packets > 30000:
                 valid = False
                 break
-        if not valid or not packets:
+        if not valid or not has_payload:
             continue
-        stream = b'\x02#!SILK_V3' + raw[start:offset]
-        # The wrapper preloads two packets without checking their boundaries.
-        # Duplicate a lone packet for that buffer, then remove its decoded PCM.
+        # With no previous decoded frame, concealment can produce no samples.
+        # Keep those initial 20 ms intervals as silence in the output instead.
+        packets -= leading_loss
+        stream = TENCENT_SILK_HEADER + raw[start + 2 * leading_loss:offset]
+        # The native wrappers preload two packets. Give them a second packet
+        # for a one-packet clip, then remove the extra PCM after decoding.
         if packets == 1:
             stream += last_packet
-        return stream + b'\xff\xff', packets
+        return stream + b'\xff\xff', packets, has_loss, leading_loss
     raise ValueError('Incomplete or unsupported SILK packet framing')
 
 
@@ -433,22 +450,36 @@ class MediaCodec:
         if not blob or len(blob)>16*1024*1024:
             self.audio_reason='invalid_audio_size'
             return None
-        raw=blob[1:] if blob.startswith(b'\x02#!SILK_V3') else blob
-        if raw.startswith(b'#!SILK_V3'):
+        if blob.startswith((SILK_HEADER,TENCENT_SILK_HEADER)):
             try:
-                stream,packets=silk_stream(blob,self.cancel)
+                stream,packets,has_loss,leading_loss=silk_stream(blob,self.cancel)
             except ValueError:
                 self.audio_reason='invalid_silk_packets'
                 return None
             try:
-                import pysilk
+                if has_loss:
+                    from pilk import decode, error as DecodeError
+                else:
+                    from pysilk import decode
+                    DecodeError = RuntimeError
             except (ImportError,RuntimeError,OSError):
                 self.audio_reason='silk_decoder_unavailable'
                 return None
             try:
-                pcm=pysilk.decode(stream,sample_rate=24000)
+                if has_loss:
+                    with tempfile.TemporaryDirectory(prefix='moect-silk-') as temporary:
+                        source = Path(temporary)/'voice.silk'
+                        decoded = Path(temporary)/'voice.pcm'
+                        source.write_bytes(stream)
+                        decode(str(source),str(decoded),pcm_rate=SILK_SAMPLE_RATE)
+                        self.cancel()
+                        with decoded.open('rb') as pcm_file:
+                            pcm = pcm_file.read(MAX_SILK_PCM_BYTES + 1)
+                else:
+                    pcm=decode(stream,sample_rate=SILK_SAMPLE_RATE)
                 self.cancel()
-                if not pcm or len(pcm)%2 or len(pcm)>144*1024*1024:
+                silence_bytes = leading_loss * (SILK_SAMPLE_RATE * 20 // 1000) * 2
+                if not pcm or len(pcm)%2 or len(pcm)+silence_bytes>MAX_SILK_PCM_BYTES:
                     self.audio_reason='silk_decode_failed'
                     return None
                 if packets==1:
@@ -457,10 +488,12 @@ class MediaCodec:
                         return None
                     pcm=pcm[:len(pcm)//2]
                 with wave.open(str(destination),'wb') as output:
-                    output.setnchannels(1);output.setsampwidth(2);output.setframerate(24000)
+                    output.setnchannels(1);output.setsampwidth(2);output.setframerate(SILK_SAMPLE_RATE)
+                    if silence_bytes:
+                        output.writeframesraw(bytes(silence_bytes))
                     output.writeframes(pcm)
                 return destination
-            except (RuntimeError,ValueError,OSError,struct.error,wave.Error):
+            except (DecodeError,RuntimeError,ValueError,OSError,struct.error,wave.Error):
                 self.audio_reason='silk_decode_failed'
                 destination.unlink(missing_ok=True)
                 return None

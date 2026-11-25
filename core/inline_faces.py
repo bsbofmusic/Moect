@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .paths import is_link
 
-TOKENS = re.compile(r'https?://[^\s<>"\']+|\[[^\[\]\r\n]{1,32}\]')
+TOKENS = re.compile(r'https?://[^\s<>"\'，。！？、；：“”【】（）]+|\[[^\[\]\r\n]{1,32}\]', re.IGNORECASE)
 
 
 @lru_cache(maxsize=8)

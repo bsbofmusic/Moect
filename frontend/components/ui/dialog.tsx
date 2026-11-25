@@ -12,22 +12,18 @@ const DialogPortal = DialogPrimitive.Portal
 
 const DialogOverlay = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Overlay>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
->(({ className, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay> & { frosted?: boolean }
+>(({ className, frosted = false, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
     data-moect-window-overlay=""
     className={cn(
       "fixed inset-0 z-[100]",
-      "bg-black/25 dark:bg-black/50",
+      frosted ? "frosted-dialog-overlay" : "bg-black/25 dark:bg-black/50",
       "data-[state=open]:animate-in data-[state=closed]:animate-out",
       "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
       className
     )}
-    style={{
-      backdropFilter: 'none',
-      WebkitBackdropFilter: 'none',
-    }}
     {...props}
   />
 ))
@@ -36,6 +32,7 @@ DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
 type DialogContentProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
   overlayClassName?: string
   fullScreen?: boolean
+  frosted?: boolean
 }
 
 /** Toast 叠在 Dialog 之上且可点；点 toast 时不能当成 Dialog「点外部」关闭。 */
@@ -53,6 +50,7 @@ export const DialogContent = React.forwardRef<
       children,
       overlayClassName,
       fullScreen = false,
+      frosted = false,
       onInteractOutside,
       onPointerDownOutside,
       ...props
@@ -60,23 +58,20 @@ export const DialogContent = React.forwardRef<
     ref
   ) => (
     <DialogPortal>
-      <DialogOverlay className={overlayClassName} />
+      <DialogOverlay frosted={frosted && !fullScreen} className={overlayClassName} />
       <DialogPrimitive.Content
         ref={ref}
         className={cn(
           fullScreen
             ? [
                 "fixed inset-0 z-[101]",
-                "w-full h-full",
-                "bg-card dark:bg-card",
+                "w-full h-full bg-card dark:bg-card",
               ]
             : [
                 "fixed left-1/2 top-1/2 z-[101]",
                 "-translate-x-1/2 -translate-y-1/2",
-                "w-full max-w-lg",
-                "bg-card dark:bg-card",
-                "rounded-xl shadow-[0_8px_30px_rgba(0,0,0,0.08)]",
-                "",
+                "w-full max-w-lg rounded-xl",
+                frosted ? "frosted-surface frosted-dialog" : "bg-card dark:bg-card shadow-[0_8px_30px_rgba(0,0,0,0.08)]",
               ],
           "data-[state=open]:animate-in data-[state=closed]:animate-out",
           "data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0",

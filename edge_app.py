@@ -10,6 +10,7 @@ from core.service import Service
 from core.version import SOURCE_URLS
 from core.edge_chrome import NativeFrame
 from core.window_state import DEFAULT_SIZE,MIN_SIZE,WindowPlacement
+from core.windows_shell import reveal_file
 
 BASE=Path(getattr(sys,'_MEIPASS',Path(__file__).parent))
 UI=BASE/'ui-qce'
@@ -64,9 +65,11 @@ class Api:
                     from core.diagnostics import write_report
                     result=write_report(svc, folders[0], payload.get('id'))
                 else:result=svc.add_storage(folders[0])
-            elif action in ('open_export','open_task_folder','open_output'):
+            elif action=='open_task_folder':
+                reveal_file(svc.task_file(payload.get('id')))
+                result={'ok':True}
+            elif action in ('open_export','open_output'):
                 if action=='open_export':target=svc.task_file(payload.get('id'))
-                elif action=='open_task_folder':target=svc.task_folder(payload.get('id'))
                 else:
                     target=Path(svc.config['export_dir']);target.mkdir(parents=True,exist_ok=True)
                 os.startfile(str(target));result={'ok':True}

@@ -3,11 +3,14 @@ import hashlib
 import json
 import os
 import base64
+import tempfile
+import threading
 import time
-from collections import OrderedDict
-from datetime import datetime,timezone,timedelta
+from collections import OrderedDict, deque
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
-from itertools import chain
+from itertools import chain, islice
 
 from .account_assets import StickerCatalog,MomentsCatalog,HASH,moment_selection,moment_preview
 from .avatars import image_type
@@ -17,9 +20,11 @@ from .sticker_cache import StickerCache
 from .media_codec import encrypted_media_variants,media_type
 from .version import APP_NAME,VERSION
 from .sns_codec import sns_variants
-from .themes import theme_archive,archive_theme
+from .themes import archive_viewer_template,archive_theme
 from .inline_faces import ArchiveFaces
 from .paths import atomic_write_bytes
+from .streaming import export_capacity, export_worker_limit, json_line, run_export_workers, write_archive_data
+from wx4 import WECHAT_TIME_ZONE
 
 
 def write_collection(folder,assets,data,cancel=lambda:None):
@@ -31,15 +36,67 @@ def write_collection(folder,assets,data,cancel=lambda:None):
                 faces.remember_text(comment.get('text'))
     faces.write(folder)
     data['theme']=archive_theme(data.get('theme'))
-    (folder/'data.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
-    encoded=json.dumps(data,ensure_ascii=False).replace('<','\\u003c').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
-    template=theme_archive((assets/'collection.html').read_text(encoding='utf-8'),data['theme']).replace('__DATE_RANGE_PICKER__',(assets/'date-range-picker.js').read_text(encoding='utf-8')).replace('__ARCHIVE_PRINT__',(assets/'archive-print.js').read_text(encoding='utf-8')).replace('__ARCHIVE_MEDIA__',(assets/'archive-media.js').read_text(encoding='utf-8')).replace('__INLINE_FACES__',(assets/'inline-faces.js').read_text(encoding='utf-8'))
-    (folder/'index.html').write_text(template.replace('__COLLECTION__',encoded),encoding='utf-8')
+    template=archive_viewer_template(assets,'collection.html',data['theme'])
+    write_archive_data(folder,template,'__COLLECTION__',data,cancel)
+
+
+def collection_media(records, store, process, fork, prepare, needs_media, status):
+    """Resolve bounded groups in isolation and publish files in input order."""
+    records = iter(records)
+    limit = export_worker_limit()
+    capacity = None
+    while window := list(islice(records, 16)):
+        selected = [(i, item) for i, item in enumerate(window) if needs_media(item)]
+        if limit == 1 or len(selected) < 2:
+            for item in window:
+                store.cancel()
+                yield process(item)
+            continue
+        prepare([item for _, item in selected])
+        if capacity is None:
+            capacity = export_capacity()
+        group_size = (len(selected) + limit - 1) // limit
+        groups = [selected[i:i+group_size] for i in range(0, len(selected), group_size)]
+        with tempfile.TemporaryDirectory(prefix='.media-', dir=store.out) as temporary:
+            def work(group):
+                folder = Path(temporary)/str(group[0][0])
+                folder.mkdir()
+                with closing(ResourceStore(store.data, '', folder, store.cancel, status,
+                                           {'includeAvatars': False}, report=False)) as worker:
+                    resolve = fork(worker)
+                    results = {i: resolve(item) for i, item in group}
+                    return folder, results, worker.stats
+
+            workers = run_export_workers(groups, work, store.cancel,
+                                         lambda: status('系统负载较高，等待可用资源…'),
+                                         ordered=True, limit=limit, capacity=capacity)
+            with closing(workers):
+                results = {}
+                selected_indices = {i for i, _ in selected}
+                for i, item in enumerate(window):
+                    store.cancel()
+                    if i not in selected_indices:
+                        yield process(item)
+                        continue
+                    if i not in results:
+                        folder, results, stats = next(workers)
+                        for kind in (folder/'resources').glob('*'):
+                            dest = store.out/'resources'/kind.name
+                            dest.mkdir(parents=True, exist_ok=True)
+                            for file in kind.iterdir():
+                                store.cancel()
+                                target = dest/file.name
+                                if not target.exists():
+                                    file.replace(target)
+                        for key, count in stats.items():
+                            store.stats[key] += count
+                    yield results.pop(i)
 
 
 def metadata(name,category,profile):
     return {'application':APP_NAME,'version':VERSION,'category':category,'name':name,'owner':{'name':profile['name'],'uid':profile['wxid']},
-            'exported_at':datetime.now().isoformat(timespec='seconds'),'time_zone':'Asia/Shanghai','partial_local_cache':True}
+            'exported_at':datetime.now(WECHAT_TIME_ZONE).replace(tzinfo=None).isoformat(timespec='seconds'),
+            'time_zone':WECHAT_TIME_ZONE.tzname(None),'partial_local_cache':True}
 
 
 def export_stickers(archive,library,payload,folder,assets,progress,cancel,status):
@@ -74,7 +131,7 @@ def export_stickers(archive,library,payload,folder,assets,progress,cancel,status
                     item['resources']=[{'kind':'image','path':path.as_posix(),'status':'available','role':'thumbnail' if quality=='thumbnail' else 'main'}]
                     resources.stats['available']+=1
                 else:resources.stats['missing']+=1
-                resources.report.write(json.dumps({k:item[k] for k in ('id','group','name','md5','status','quality')},ensure_ascii=False)+'\n')
+                resources.report.write(json_line({k:item[k] for k in ('id','group','name','md5','status','quality')}))
                 data['items'].append(item)
         data['resource_summary']=dict(resources.stats)
     finally:resources.close()
@@ -87,6 +144,11 @@ class MomentResources:
         self.resources=resources;self.index=None;self.cache=Path(cache).resolve() if cache else None;self.cached={}
         self.index_seconds=index_seconds;self.max_image_bytes=max_image_bytes
         self.key_samples=None;self.last_failure=None
+        self.source=None
+        self.dat_lock=threading.Lock()
+        self.index_lock=threading.Lock()
+        self.converting=threading.Condition()
+        self.in_flight=set()
         self.converted=OrderedDict()
         if self.cache and (self.cache/'media.json').is_file():
             try:
@@ -97,9 +159,31 @@ class MomentResources:
     @staticmethod
     def media_key(item):return hashlib.sha256(json.dumps(item,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
-    def local_candidates(self,hints):
-        if self.index is None:
-            self.index={};account=Path(self.resources.data.account_dir()).resolve();cache=account/'cache'
+    def fork(self, resources):
+        resolver = MomentResources(resources, max_image_bytes=self.max_image_bytes)
+        resolver.cache, resolver.cached = self.cache, self.cached
+        resolver.source = self
+        return resolver
+
+    def decode_dat(self, raw, path, hints):
+        # Keep key recovery, sample selection and the scan budget shared by the export.
+        with self.dat_lock:
+            store = self.resources
+            store.cancel()
+            if self.key_samples is None:
+                from .image_recovery import recent_image_samples
+                self.key_samples = recent_image_samples(store.data,store.cancel) if store.keys.scan_remaining>0 else []
+            decoded = store.keys.decode(raw,path,self.key_samples,hints.get('keys',[]))
+            image = store.keys.rendered or (store.codec.image(decoded) if decoded else None)
+            reason = store.keys.reason or 'image_decode_failed'
+            return image, {'status':'encrypted' if reason in ('aes_key_unavailable','xor_unresolved') else 'corrupt',
+                           **store.keys.diagnostics,'reason':reason}
+
+    def _local_index(self):
+        with self.index_lock:
+            if self.index is not None:return self.index
+            self.resources.keys.progress('正在查找本机朋友圈附件…')
+            index={};account=Path(self.resources.data.account_dir()).resolve();cache=account/'cache'
             deadline=time.monotonic()+self.index_seconds if self.index_seconds is not None else float('inf')
             if cache.is_dir():
                 for month in sorted(cache.iterdir(),reverse=True):
@@ -116,10 +200,15 @@ class MomentResources:
                             stem=p.stem.lower()
                             digest=stem if HASH.fullmatch(stem) else (p.parent.name+stem).lower()
                             if HASH.fullmatch(digest) and not p.is_symlink() and p.resolve().is_relative_to(account):
-                                self.index.setdefault(digest,[]).append(p)
+                                index.setdefault(digest,[]).append(p)
+            self.index=index
+            return index
+
+    def local_candidates(self,hints):
+        index=(self.source or self)._local_index()
         result=[]
         for digest in hints.get('hashes',[]):
-            for path in self.index.get(digest,[]):
+            for path in index.get(digest,[]):
                 thumbnail=digest in hints.get('thumbnail_hashes',[]) and digest not in hints.get('main_hashes',[]) or path.suffix.lower()=='.thumb' or any('thumb' in part.lower() for part in path.parts)
                 result.append((path,'thumbnail' if thumbnail else 'main'))
         result.sort(key=lambda row:(row[1]!='main',row[0].suffix.lower()=='.tmp'))
@@ -132,55 +221,65 @@ class MomentResources:
             stat = path.stat()
             if stat.st_size>(256*1024*1024 if kind=='video' else self.max_image_bytes):
                 self.last_failure={'status':'unsupported','reason':'file_too_large'};return None
-            identity=(path,kind,bool(hints.get('animated')),stat.st_size,stat.st_mtime_ns)
-            if identity in self.converted:
-                self.converted.move_to_end(identity)
-                store.stats['available']+=1
-                return dict(self.converted[identity])
-
-            def remember(resource):
-                self.converted[identity]=dict(resource)
-                if len(self.converted)>1024:self.converted.popitem(last=False)
-                return resource
-            if kind=='video':
-                with path.open('rb') as stream:signature=media_type(stream.read(32))
-                original=path
-                if not signature or not signature[1].startswith('video/'):
-                    # SNS video encryption affects only the first 128 KiB.
-                    with path.open('rb') as stream:prefix=stream.read(128*1024)
-                    decoded=next((candidate for candidate in sns_variants(prefix,hints.get('stream_keys',[]),store.cancel)
-                                  if media_type(candidate) and media_type(candidate)[1].startswith('video/')),None)
-                    if decoded is None:return None
-                    target=Path(store.tmp.name)/'sns-decrypted.mp4'
-                    with path.open('rb') as source,target.open('wb') as output:
-                        source.seek(len(prefix));output.write(decoded)
-                        while True:
-                            store.cancel();block=source.read(1024*1024)
-                            if not block:break
-                            output.write(block)
-                    path=target
-                result=store.codec.video(path,Path(store.tmp.name)/'sns-playback.mp4')
-                if result:return remember(store._copy(result,'video',extension='.mp4',identity_source=original))
-            else:
-                raw=path.read_bytes()
-                if raw.startswith((b'\x07\x08V1',b'\x07\x08V2')):
-                    # Local SNS caches use the same DAT envelope as chat images.
-                    # CDN/ISAAC decoding alone cannot read these files.
-                    if self.key_samples is None:
-                        from .image_recovery import recent_image_samples
-                        self.key_samples=recent_image_samples(store.data,store.cancel) if store.keys.scan_remaining>0 else []
-                    decoded=store.keys.decode(raw,path,self.key_samples,hints.get('keys',[]))
-                    image=store.keys.rendered or (store.codec.image(decoded) if decoded else None)
-                    if image:return remember(store._copy(path,'image',image,'.'+image_type(image)[0]))
-                    reason=store.keys.reason or 'image_decode_failed'
-                    self.last_failure={'status':'encrypted' if reason in ('aes_key_unavailable','xor_unresolved') else 'corrupt',
-                                       **store.keys.diagnostics,'reason':reason}
-                    return None
-                for blob in chain((raw,),sns_variants(raw,hints.get('stream_keys',[]),store.cancel),encrypted_media_variants(raw,hints.get('keys',[]),store.cancel)):
-                    image=(store.codec.sticker if hints.get('animated') else store.codec.image)(blob)
-                    if image:return remember(store._copy(path,'image',image,'.'+image_type(image)[0]))
+            identity=(path,kind,bool(hints.get('animated')),stat.st_size,stat.st_mtime_ns,
+                      tuple(hints.get('stream_keys',())),tuple(hints.get('keys',())))
+            shared=self.source or self
+            with shared.converting:
+                while identity in shared.in_flight:
+                    store.cancel()
+                    shared.converting.wait(.2)
+                if identity in shared.converted:
+                    shared.converted.move_to_end(identity)
+                    store.stats['available']+=1
+                    return dict(shared.converted[identity])
+                shared.in_flight.add(identity)
+            result=None
+            try:
+                result=self._convert(path,kind,hints)
+                return result
+            finally:
+                with shared.converting:
+                    # The owner's group will publish the file even if another group references it first.
+                    if result:
+                        shared.converted[identity]=dict(result)
+                        if len(shared.converted)>1024:shared.converted.popitem(last=False)
+                    shared.in_flight.remove(identity)
+                    shared.converting.notify_all()
         except OSError:self.last_failure={'status':'missing','reason':'local_file_unreadable'}
         except ValueError:pass
+        return None
+
+    def _convert(self,path,kind,hints):
+        store=self.resources
+        if kind=='video':
+            with path.open('rb') as stream:signature=media_type(stream.read(32))
+            original=path
+            if not signature or not signature[1].startswith('video/'):
+                # SNS video encryption affects only the first 128 KiB.
+                with path.open('rb') as stream:prefix=stream.read(128*1024)
+                decoded=next((candidate for candidate in sns_variants(prefix,hints.get('stream_keys',[]),store.cancel)
+                              if media_type(candidate) and media_type(candidate)[1].startswith('video/')),None)
+                if decoded is None:return None
+                target=Path(store.tmp.name)/'sns-decrypted.mp4'
+                with path.open('rb') as source,target.open('wb') as output:
+                    source.seek(len(prefix));output.write(decoded)
+                    while True:
+                        store.cancel();block=source.read(1024*1024)
+                        if not block:break
+                        output.write(block)
+                path=target
+            result=store.codec.video(path,Path(store.tmp.name)/'sns-playback.mp4')
+            if result:return store._copy(result,'video',extension='.mp4',identity_source=original)
+        else:
+            raw=path.read_bytes()
+            if raw.startswith((b'\x07\x08V1',b'\x07\x08V2')):
+                image,failure=(self.source or self).decode_dat(raw,path,hints)
+                if image:return store._copy(path,'image',image,'.'+image_type(image)[0])
+                self.last_failure=failure
+                return None
+            for blob in chain((raw,),sns_variants(raw,hints.get('stream_keys',[]),store.cancel),encrypted_media_variants(raw,hints.get('keys',[]),store.cancel)):
+                image=(store.codec.sticker if hints.get('animated') else store.codec.image)(blob)
+                if image:return store._copy(path,'image',image,'.'+image_type(image)[0])
         return None
 
     def resolve(self,item,include_images,include_videos):
@@ -279,6 +378,13 @@ def export_moments(archive,library,payload,folder,assets,progress,cancel,status)
     catalog=MomentsCatalog(library,profile['wxid'],selection['scope'],selection['author_id']);name=profile['name']+' · '+selection['label']
     data=metadata(name,'moments',profile);data.update(items=[],scope=selection,theme=archive_theme(payload.get('_theme')),filters={k:payload[k] for k in ('start','end') if payload.get(k)},
         notice='范围：'+selection['label']+'。包含本次已整理的可访问动态、评论和点赞；微信权限和资源有效期可能使结果不完整。HTML 内可按作者和时间继续筛选本次归档。')
+    status('正在筛选待导出的朋友圈…')
+    with closing(catalog.posts(cancel,start=payload.get('_start'),end=payload.get('_end'))) as source:
+        posts=deque(source)
+    if not catalog.available:raise ValueError('尚无可读取的朋友圈数据库。请先在微信浏览朋友圈，再刷新资源快照。')
+    if not posts:raise ValueError('本机尚未缓存所选范围和时间段的朋友圈。请在微信浏览相应时间线或账号主页，再刷新资源快照。')
+    total=len(posts)
+    progress(0,total)
     resources=ResourceStore(archive.data,'',folder,cancel,status,{'includeAvatars':False})
     resolver=MomentResources(resources,Path(library.get('assets_root') or library['root'])/'preview')
     avatars={}
@@ -287,10 +393,35 @@ def export_moments(archive,library,payload,folder,assets,progress,cancel,status)
             avatars[uid]=archive.avatars.export(uid,folder) or ''
         return avatars.get(uid,'')
 
-    start=payload.get('_start');end=payload.get('_end');count=0
-    try:
-        for post in catalog.posts(cancel,start=start,end=end):
-            count+=1;progress(count,0);item=clean(post);item['resources']=[];item['media_status']=[];item['media_diagnostics']=[]
+    def needs_media(post):
+        return any(images if media['kind']=='image' else videos for media in post['media']) or (
+            images and any(comment.get('_attachments') for comment in post.get('comments',[])))
+
+    def with_media(worker):
+        def resolve(post):
+            comments=[]
+            for comment in post.get('comments',[]):
+                attachments=[]
+                for media in comment.get('_attachments',[]):
+                    cancel()
+                    attachments.extend(worker.resolve(media,images,False)['resources'])
+                comments.append(attachments)
+            media=[]
+            for attachment in post['media']:
+                cancel()
+                media.append(worker.resolve(attachment,images,videos))
+            return post,comments,media
+        return resolve
+
+    def prepare(_):
+        status('正在处理朋友圈附件…')
+
+    entries=collection_media((posts.popleft() for _ in range(total)),resources,with_media(resolver),
+                             lambda worker: with_media(resolver.fork(worker)),prepare,needs_media,status)
+    with closing(resources), closing(entries):
+        for count,(post,comment_media,post_media) in enumerate(entries,1):
+            item=clean({key:value for key,value in post.items() if key!='media'})
+            item.update(resources=[],media_status=[],media_diagnostics=[])
             item['author_name']=archive.data.name_of(post['author']) or post['author']
             item['author_avatar']=avatar(post['author'])
             for person in item.get('likes',[])+item.get('comments',[]):
@@ -299,26 +430,22 @@ def export_moments(archive,library,payload,folder,assets,progress,cancel,status)
                 person['avatar']=avatar(uid)
                 if person.get('reply_uid'):
                     person['reply_name']=archive.data.name_of(person['reply_uid']) or person.get('reply_name') or person['reply_uid']
-            for source,comment in zip(post.get('comments',[]),item.get('comments',[])):
-                comment['resources']=[]
-                for media in source.get('_attachments',[]):
-                    cancel();result=resolver.resolve(media,images,False);comment['resources'].extend(result['resources'])
+            for comment,attachments in zip(item.get('comments',[]),comment_media):
+                comment['resources']=attachments
             if post['status']=='unsupported':resources.stats['unsupported']+=1
-            for media in post['media']:
-                cancel();result=resolver.resolve(media,images,videos);item['resources'].extend(result['resources']);item['media_status'].append(result['status'])
+            for result in post_media:
+                item['resources'].extend(result['resources']);item['media_status'].append(result['status'])
                 item['media_diagnostics'].append({k:result[k] for k in ('kind','status','reason','diagnostics') if k in result})
-            item.pop('media',None)
             if item['create_time']:
-                try:item['time_str']=datetime.fromtimestamp(item['create_time'],timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+                try:item['time_str']=datetime.fromtimestamp(item['create_time'],WECHAT_TIME_ZONE).strftime('%Y-%m-%d %H:%M:%S')
                 except (ValueError,OverflowError,OSError):item['time_str']='时间未知'
-            resources.report.write(json.dumps({'id':item['id'],'status':item['status'],'media_status':item['media_status'],
-                                               'media_diagnostics':item['media_diagnostics']},ensure_ascii=False)+'\n')
+            resources.report.write(json_line({'id':item['id'],'status':item['status'],'media_status':item['media_status'],
+                                              'media_diagnostics':item['media_diagnostics']}))
             data['items'].append(item)
+            progress(count,total)
         data['resource_summary']=dict(resources.stats)
-    finally:resources.close()
-    if not catalog.available:raise ValueError('尚无可读取的朋友圈数据库。请先在微信浏览朋友圈，再刷新资源快照。')
-    if not count:raise ValueError('本机尚未缓存所选范围和时间段的朋友圈。请在微信浏览相应时间线或账号主页，再刷新资源快照。')
     data['items'].sort(key=lambda p:(p['create_time'],p['id']),reverse=True)
+    status('正在写入朋友圈归档…')
     cancel();write_collection(folder,assets,data,cancel)
     timestamps=[p['create_time'] for p in data['items'] if p['create_time']]
     return {'name':name,'path':str(folder/'index.html'),'count':count,'format':'moments','resource_summary':data['resource_summary'],

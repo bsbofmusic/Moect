@@ -173,7 +173,7 @@ export function StoragePage({
         </p>
       )}
       <Dialog open={confirm} onOpenChange={setConfirm}>
-        <DialogContent className="w-[calc(100%_-_2rem)] max-w-md p-6">
+        <DialogContent frosted className="w-[calc(100%_-_2rem)] max-w-md p-6">
           <div className="space-y-2">
             <DialogTitle>清理过期缓存</DialogTitle>
             <DialogDescription className="text-sm leading-relaxed">

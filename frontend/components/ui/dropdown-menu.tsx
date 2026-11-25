@@ -34,15 +34,20 @@ function DropdownMenuTrigger({
 function DropdownMenuContent({
   className,
   sideOffset = 6,
+  frosted = false,
   ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Content> & { frosted?: boolean }) {
   return (
     <DropdownMenuPrimitive.Portal>
       <DropdownMenuPrimitive.Content
         data-slot="dropdown-menu-content"
         sideOffset={sideOffset}
         className={cn(
-          "z-[9999] min-w-[180px] overflow-hidden rounded-[10px] border border-black/[0.08] dark:border-white/[0.14] bg-white/95 dark:bg-[#0A0A0A] p-1 text-[#171717] dark:text-[#EDEDED] shadow-[0_4px_24px_rgba(0,0,0,0.08),0_1px_3px_rgba(0,0,0,0.03)] dark:shadow-[0_4px_24px_rgba(0,0,0,0.4)] backdrop-blur-[8px] origin-[var(--radix-dropdown-menu-content-transform-origin)] data-[state=open]:animate-[dropdown-in_240ms_cubic-bezier(0.34,1.56,0.64,1)] data-[state=closed]:animate-[dropdown-out_150ms_ease-in]",
+          "z-[9999] min-w-[180px] overflow-hidden rounded-[10px] p-1 text-[#171717] dark:text-[#EDEDED]",
+          "origin-[var(--radix-dropdown-menu-content-transform-origin)] data-[state=open]:animate-[var(--dropdown-enter)] data-[state=closed]:animate-[dropdown-out_150ms_ease-in]",
+          frosted
+            ? "frosted-surface"
+            : "border border-black/[0.08] dark:border-white/[0.14] bg-white/95 dark:bg-[#0A0A0A] shadow-[0_4px_24px_rgba(0,0,0,0.08),0_1px_3px_rgba(0,0,0,0.03)] dark:shadow-[0_4px_24px_rgba(0,0,0,0.4)] backdrop-blur-[8px]",
           className
         )}
         {...props}

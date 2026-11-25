@@ -16,6 +16,7 @@ from core.service import Service
 from core.version import SOURCE_URLS
 from core.window_chrome import configure_frame, native_message
 from core.window_state import DEFAULT_SIZE, MIN_SIZE
+from core.windows_shell import reveal_file
 
 BASE = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
 UI = BASE/'ui-qce'
@@ -91,11 +92,15 @@ class Bridge(QObject):
                 selected={'choose_archive':'import_path','choose_storage':'storage_path','choose_cache':'cache_path','choose_diagnostics':'diagnostics_path'}
                 action, payload=selected[action],{'path':folder,'id':payload.get('id')}
             if action in ('open_export','open_task_folder','open_output'):
+                if action=='open_task_folder' and os.name=='nt':
+                    reveal_file(self.service.task_file(payload.get('id')))
+                    self.send(request_id,{'ok':True}); return
                 if action=='open_output':
                     target=Path(self.service.config['export_dir']); target.mkdir(parents=True,exist_ok=True)
+                elif action=='open_export':
+                    target=self.service.task_file(payload.get('id'))
                 else:
                     target=self.service.task_folder(payload.get('id'))
-                    if action=='open_export': target=self.service.task_file(payload.get('id'))
                 if os.name=='nt':os.startfile(str(target))
                 elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):raise ValueError('无法打开文件位置')
                 self.send(request_id,{'ok':True}); return

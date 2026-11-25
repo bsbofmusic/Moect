@@ -2,8 +2,10 @@
 import io
 import json
 import sqlite3
+import struct
 import tempfile
 import unittest
+import wave
 import zipfile
 import base64
 import hashlib
@@ -62,7 +64,28 @@ class PackagingTests(unittest.TestCase):
                 self.assertIn('合成聊天', archive.read('中文 # 100%.html').decode())
                 self.assertEqual(archive.getinfo('已压缩.mp4').compress_type, zipfile.ZIP_STORED)
                 self.assertEqual(archive.read('已压缩.mp4'), b'synthetic media payload')
+                if not password:
+                    raw = target.read_bytes()
+                    for entry in archive.infolist():
+                        self.assertLess(struct.unpack_from('<H', raw, entry.header_offset + 4)[0], 45)
+            original = target.read_bytes()
+            with self.assertRaises(FileExistsError):
+                package_folder(source, target, password, lambda: None, lambda _: None)
+            self.assertEqual(target.read_bytes(), original)
         self.assertTrue((source/'中文 # 100%.html').is_file())
+
+    def test_larger_zip_entries_keep_zip64_available(self):
+        source = self.root/'source'
+        source.mkdir()
+        payload = b'a' * 4096
+        (source/'large.txt').write_bytes(payload)
+        target = self.root/'large.zip'
+        with patch('zipfile.ZIP64_LIMIT', 1024):
+            package_folder(source, target, None, lambda: None, lambda _: None)
+        with zipfile.ZipFile(target) as archive:
+            entry = archive.getinfo('large.txt')
+            self.assertGreaterEqual(entry.extract_version, 45)
+            self.assertEqual(archive.read(entry), payload)
 
     def test_cancelled_compression_removes_only_partial_zip(self):
         source = self.root/'source';source.mkdir();(source/'record').write_bytes(b'x'*1024)
@@ -134,6 +157,35 @@ class ExcelAndPreviewTests(unittest.TestCase):
                         reconstructed.append(values['F'])
             self.assertEqual(''.join(reconstructed), content)
 
+    def test_excel_retains_nested_attachment_paths_and_excess_line_feeds(self):
+        archive = Archive(fixture(self.root/'db', count=1));self.addCleanup(archive.close)
+        sample = next(archive.messages(SESSION))
+        attachments = [f'resources/file/文件 {number}.pdf' for number in range(260)]
+        body = '多行正文\n' * 300 + '结束'
+        parent = [dict(path=attachments[0])]
+        reply = dict(text='引用', resources=[dict(path=attachments[1])])
+        child = dict(text='转发', resources=[dict(path=path) for path in [*attachments[2:], attachments[0]]])
+        sample.update(text=body, resources=parent, quote=reply, forward={'messages': [child]})
+        folder = self.root/'excel'
+        folder.mkdir()
+        with patch.object(archive, 'messages', return_value=iter([sample])), \
+             patch('core.exporting.ResourceStore.enrich', side_effect=lambda message: message):
+            result = export_session(archive, archive.sessions()[0], {'format': 'xlsx'},
+                                    folder, ASSETS, lambda _: None, lambda: None)
+        namespace = {'x': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        with zipfile.ZipFile(result['path']) as workbook:
+            xml = ET.fromstring(workbook.read('xl/worksheets/sheet1.xml'))
+        rows = [{cell.attrib['r'].rstrip('0123456789'): ''.join(t.text or '' for t in cell.findall('.//x:t', namespace))
+                 for cell in row} for row in xml.findall('.//x:sheetData/x:row', namespace)[1:]]
+        self.assertEqual(result['count'], 1)
+        self.assertGreater(len(rows), 1)
+        self.assertTrue(all(row['G'] == sample['server_id'] for row in rows))
+        self.assertTrue(all(value.count('\n') <= 253 for row in rows for value in (row['F'], row['H'])))
+        self.assertTrue(''.join(row['F'] for row in rows).startswith(body))
+        prefix = Path(result['path']).stem + '_assets/'
+        self.assertEqual([path for row in rows for path in row['H'].splitlines()],
+                         [prefix + path for path in attachments])
+
     def test_preview_reads_local_images_and_voice_without_network_or_key_scanning(self):
         library = media_fixture(self.root)
         service = Service(ASSETS, self.root/'state');service.library = library;self.addCleanup(service.shutdown)
@@ -159,11 +211,12 @@ class ExcelAndPreviewTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root/'db/message/media_0.db')) as connection, connection:
             connection.executescript('CREATE TABLE Name2Id(user_name TEXT); CREATE TABLE VoiceInfo(chat_name_id INTEGER,svr_id INTEGER,create_time INTEGER,voice_data BLOB);')
             connection.execute('INSERT INTO Name2Id VALUES(?)', (SESSION,))
-            connection.execute('INSERT INTO VoiceInfo VALUES(1,1,1800000000,?)', (silk_fixture(),))
+            connection.execute('INSERT INTO VoiceInfo VALUES(1,1,1800000000,?)', (silk_fixture() + b'\0\0\xff\xff',))
         service = Service(ASSETS, self.root/'state');service.library = library;self.addCleanup(service.shutdown)
         result = service.preview_media({'session': SESSION, 'shard': 0, 'local_id': 1, 'server_id': '1'})
         self.assertEqual(result['kind'], 'audio')
-        self.assertEqual(base64.b64decode(result['url'].split(',', 1)[1])[:4], b'RIFF')
+        with wave.open(io.BytesIO(base64.b64decode(result['url'].split(',', 1)[1])), 'rb') as audio:
+            self.assertEqual((audio.getframerate(),audio.getnframes()), (24000,5280))
 
 
 class StorageAndDiagnosticsTests(unittest.TestCase):

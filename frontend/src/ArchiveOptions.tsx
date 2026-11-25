@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useId } from "react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { call } from "./native";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
@@ -96,9 +97,10 @@ export function ArchiveOptions({
   disabled?: boolean;
 }) {
   const id = useId();
+  const reducedMotion = useReducedMotion();
   return (
     <section className="space-y-3" aria-label="压缩与加密">
-      <div className="rounded-2xl bg-muted/40 divide-y divide-border/50">
+      <div className="rounded-2xl bg-muted/40">
         <div className="flex items-center justify-between gap-5 px-5 py-4">
           <div>
             <label htmlFor={id + "-zip"} className="text-[13px] font-medium">
@@ -112,7 +114,7 @@ export function ArchiveOptions({
             onCheckedChange={model.setZip}
           />
         </div>
-        <div className="flex items-center justify-between gap-5 px-5 py-4">
+        <div className="flex items-center justify-between gap-5 border-t border-border/50 px-5 py-4">
           <div>
             <label
               htmlFor={id + "-encrypt"}
@@ -123,34 +125,47 @@ export function ArchiveOptions({
           </div>
           <Switch
             id={id + "-encrypt"}
+            aria-controls={id + "-password-panel"}
             checked={model.encrypt}
             disabled={!model.loaded || disabled}
             onCheckedChange={model.setEncrypt}
           />
         </div>
-        {model.encrypt && (
-          <div className="px-5 py-4 space-y-2">
-            <label
-              className="text-[13px] font-medium"
-              htmlFor={id + "-password"}
-            >
-              压缩包密码
-            </label>
-            <Input
-              id={id + "-password"}
-              type="password"
-              autoComplete="new-password"
-              maxLength={256}
-              disabled={!model.loaded || disabled}
-              value={model.password}
-              placeholder={model.hasPassword ? "" : "输入解压密码"}
-              onChange={(event) => model.setPassword(event.target.value)}
-              onBlur={() => {
-                model.savePassword().catch(() => {});
-              }}
-            />
-          </div>
-        )}
+        <div id={id + "-password-panel"} inert={!model.encrypt}>
+          <AnimatePresence initial={false}>
+            {model.encrypt && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: "auto", opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: reducedMotion ? 0 : 0.18, ease: "easeOut" }}
+                className="overflow-hidden"
+              >
+                <div className="space-y-2 border-t border-border/50 px-5 py-4">
+                  <label
+                    className="text-[13px] font-medium"
+                    htmlFor={id + "-password"}
+                  >
+                    压缩包密码
+                  </label>
+                  <Input
+                    id={id + "-password"}
+                    type="password"
+                    autoComplete="new-password"
+                    maxLength={256}
+                    disabled={!model.loaded || disabled}
+                    value={model.password}
+                    placeholder={model.hasPassword ? "" : "输入解压密码"}
+                    onChange={(event) => model.setPassword(event.target.value)}
+                    onBlur={() => {
+                      model.savePassword().catch(() => {});
+                    }}
+                  />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
       {model.error && (
         <p role="alert" className="text-xs text-red-600">

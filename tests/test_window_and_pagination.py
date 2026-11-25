@@ -106,30 +106,40 @@ class WindowStateTests(unittest.TestCase):
 class ArchivePaginationTests(unittest.TestCase):
     def test_actual_query_loads_latest_keeps_numbered_jump_and_filters_bounded(self):
         source=(ASSETS/'viewer.html').read_text(encoding='utf-8')
-        model=re.search(r'^function paginationModel[^\n]+',source,re.M).group()
-        render=source[source.index('function renderPagination('):source.index('function draw(){')]
+        shell=(ASSETS/'archive-shell.js').read_text(encoding='utf-8')
+        render=source[source.index('function renderPagination('):source.index('function messageRow(')]
         helpers='\n'.join(re.search(r'^function '+name+r'[^\n]+',source,re.M).group() for name in ('matches','outside'))
-        query=source[source.index('async function query('):source.index('async function jump(')]
+        query=source[source.index('async function runRead('):source.index('async function jump(')]
         script='''const assert=require('node:assert/strict');
-let page=0,pageGroup=0,reading=false,records=[],generation=0,total=0,selection=null,size=80,loads=[],scrolled=[];
+let page=0,reading=false,records=[],generation=0,total=0,selection=null,size=80,loads=[],scrolled=[],holdNextLoad=null;
 let filter={q:'',start:null,end:null},manifest={count:1360,chunks:[]};
 const chunks=Array.from({length:17},(_,i)=>Array.from({length:80},(_,j)=>({create_time:i*80+j,text:String(i*80+j)})));
 manifest.chunks=chunks.map(rows=>({count:rows.length,start_time:rows[0].create_time,end_time:rows.at(-1).create_time}));
-function fake(){return {children:[],disabled:false,hidden:false,textContent:'',replaceChildren(){this.children=[]},append(el){this.children.push(el)},setAttribute(k,v){this[k]=v}}}
+function fake(){return {children:[],disabled:false,hidden:false,textContent:'',replaceChildren(){this.children=[]},append(el){this.children.push(el)},setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]}}}
 const elements=new Map(),$=id=>{if(!elements.has(id))elements.set(id,fake());return elements.get(id)};
 const element=(tag,cls,value)=>({...fake(),textContent:String(value)});
-const document={documentElement:{scrollHeight:5000}},scrollTo=(x,y)=>scrolled.push(y),requestAnimationFrame=fn=>fn();
-const filters=()=>({...filter}),searchable=m=>m.text,load=async i=>{loads.push(i);return chunks[i]};
-function draw(){renderPagination()}
-'''+model+'\n'+render+'\n'+helpers+'\n'+query+'''
+const document={documentElement:{scrollHeight:5000},getElementById:id=>$('#'+id),createElement:fake};
+const scrollTo=(x,y)=>scrolled.push(y),requestAnimationFrame=fn=>fn();
+const MoectPrint={busy:false};
+const filters=()=>({...filter}),searchable=m=>m.text,load=async i=>{
+ loads.push(i);if(holdNextLoad){const hold=holdNextLoad;holdNextLoad=null;await hold}return chunks[i];
+};
+const messageRow=m=>m;
+function draw(rows){records=rows;$('#notice').textContent='';renderPagination()}
+'''+shell+'\n'+render+'\n'+helpers+'\n'+query+'''
+const pager=MoectArchive.mountPager({pageSize:size,label:'聊天记录分页',onPage:goPage});
 (async()=>{
  await query();assert.equal(page,16);assert.equal(records[0].create_time,1280);assert.equal(records.at(-1).create_time,1359);assert.deepEqual(loads,[16]);assert.equal(scrolled.at(-1),5000);
  assert.deepEqual($('#page-buttons').children.map(b=>+b.textContent),[11,12,13,14,15,16,17]);assert.equal($('#prev-group').disabled,false);assert.equal($('#next-group').disabled,true);
- pageGroup=0;renderPagination(false);assert.deepEqual($('#page-buttons').children.map(b=>+b.textContent),[1,2,3,4,5,6,7,8,9,10]);assert.equal(page,16);assert.equal($('#next-group').disabled,false);
+ $('#prev-group').onclick();assert.deepEqual($('#page-buttons').children.map(b=>+b.textContent),[1,2,3,4,5,6,7,8,9,10]);assert.equal(page,16);assert.equal($('#next-group').disabled,false);
  await $('#page-buttons').children[2].onclick();assert.equal(page,2);assert.equal(records[0].create_time,160);assert.equal(scrolled.at(-1),0);
  filter={q:'',start:300,end:304};await query();assert.deepEqual(records.map(r=>r.create_time),[300,301,302,303,304]);assert.equal(page,0);assert.equal($('#prev-group').hidden,true);assert.equal($('#next-group').hidden,true);
  filter={q:'none',start:null,end:null};await query();assert.equal(total,0);assert.equal(records.length,0);assert.equal($('#page-buttons').children.length,0);assert.equal($('#next').disabled,true);
- assert.deepEqual(paginationModel(800,0).numbers,[1,2,3,4,5,6,7,8,9,10]);assert.equal(paginationModel(801,0).nextGroup,true);assert.deepEqual(paginationModel(801,10).numbers,[11]);
+ let rejectOld;holdNextLoad=new Promise((_,reject)=>{rejectOld=reject});
+ filter={q:'will fail',start:null,end:null};const stale=query();
+ filter={q:'',start:300,end:304};await query();rejectOld(new Error('stale error'));await stale;
+ assert.deepEqual(records.map(r=>r.create_time),[300,301,302,303,304]);assert.equal(reading,false);assert.equal($('#notice').textContent,'');
+ assert.deepEqual(MoectArchive.paginationModel(800,0,size).numbers,[1,2,3,4,5,6,7,8,9,10]);assert.equal(MoectArchive.paginationModel(801,0,size).nextGroup,true);assert.deepEqual(MoectArchive.paginationModel(801,10,size).numbers,[11]);
 })().catch(e=>{console.error(e);process.exitCode=1});'''
         result=subprocess.run(['node'],input=script,text=True,encoding='utf-8',capture_output=True)
         self.assertEqual(result.returncode,0,result.stderr)

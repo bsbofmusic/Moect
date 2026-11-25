@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from contextlib import closing
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 from PIL import Image
 
 from core.data import Archive
@@ -44,7 +44,7 @@ class Release125UiTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.browser.close();cls.runtime.stop();cls.server.shutdown();cls.server.server_close();cls.thread.join()
 
-    def app(self, invalid_timestamp=False, viewport=None, device_scale_factor=1, last_export_sessions=()):
+    def app(self, invalid_timestamp=False, viewport=None, device_scale_factor=1, last_export_sessions=(), tasks=()):
         context = self.browser.new_context(viewport=viewport or {'width':1080, 'height':800},
                                            device_scale_factor=device_scale_factor, reduced_motion='reduce')
         self.addCleanup(context.close)
@@ -55,11 +55,14 @@ class Release125UiTests(unittest.TestCase):
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
         image = 'data:image/png;base64,' + base64.b64encode(PNG).decode()
-        page.add_init_script('window.__image=' + json.dumps(image) + r''';
+        page.add_init_script('window.__image=' + json.dumps(image) + ';window.__fixtureTasks=' + json.dumps(tasks) + r''';
           window.__calls=[];window.__payloads=[];window.__assetPayloads=[];window.__prefs={zip:false,encrypt:false,has_password:false};
+          window.__exportActions=[];
           const online={configured:false,checking:false,initial_check_done:true,revision:0,error:'',has_update:false,unread_count:0,announcements:[],download:{status:'idle'}};
           const state={version:'1.2.5',theme:'light',accent:'violet',appearance:{},accents:[],export_dir:'Synthetic exports',image_recovery_skip_help:localStorage.getItem('synthetic-recovery-skip')==='true',
-            storage_dir:'D:/Synthetic cache',storage_busy:false,storage_warning:'',tasks:[],online,
+            moments_timeline_help_hidden:localStorage.getItem('synthetic-moments-help-hidden')==='true',
+            favorites_help_hidden:localStorage.getItem('synthetic-favorites-help-hidden')==='true',
+            storage_dir:'D:/Synthetic cache',storage_busy:false,storage_warning:'',tasks:window.__fixtureTasks,online,
             session_sort:{field:'lastActivity',order:'desc'},last_export_available:window.__lastExportSessions.length>0,
             library:{name:'Synthetic',profile:{name:'Synthetic',wxid:'synthetic'},live:true,demo:false}};
           const sessions=[{username:'friend',display:'普通好友',category:'friend'},{username:'gh_sample',display:'示例公众号',category:'official'},
@@ -72,7 +75,13 @@ class Release125UiTests(unittest.TestCase):
             else if(action==='last_export_sessions')result=window.__lastExportSessions;
             else if(action==='detect')result={running:false,accounts:[{id:'synthetic-account',name:'Synthetic',wxid:'synthetic',connected:true}]};
             else if(action==='sessions')result=sessions;
-            else if(action==='settings'){Object.assign(state,payload);if(typeof payload.image_recovery_skip_help==='boolean')localStorage.setItem('synthetic-recovery-skip',String(payload.image_recovery_skip_help));result=state;}
+            else if(action==='settings'){
+              Object.assign(state,payload);
+              if(typeof payload.image_recovery_skip_help==='boolean')localStorage.setItem('synthetic-recovery-skip',String(payload.image_recovery_skip_help));
+              if(typeof payload.moments_timeline_help_hidden==='boolean')localStorage.setItem('synthetic-moments-help-hidden',String(payload.moments_timeline_help_hidden));
+              if(typeof payload.favorites_help_hidden==='boolean')localStorage.setItem('synthetic-favorites-help-hidden',String(payload.favorites_help_hidden));
+              result=state;
+            }
             else if(action==='tutorial_status')result={seen:true};
             else if(action==='startup_reconnect')result={skipped:true};
             else if(action==='archive_preferences'){
@@ -84,6 +93,7 @@ class Release125UiTests(unittest.TestCase):
             }else if(action==='export'){window.__payloads.push(payload);result={job:'synthetic-export'};}
             else if(action==='account_assets')result={available:true,total:2,count:2,groups:[{id:'favorites',name:'合成表情',count:2}],posts:[],selection:{label:'我的朋友圈'}};
             else if(action==='export_account'){window.__assetPayloads.push(payload);result={job:'synthetic-assets'};}
+            else if(action==='open_task_folder'||action==='source')window.__exportActions.push({action,payload});
             else if(action==='storage_info')result={path:state.storage_dir,bytes:2048,roots:[{path:state.storage_dir,current:true,bytes:2048,categories:{archives:1024,previews:1024}}]};
             else if(action==='storage_cleanup'||action==='choose_cache')result={job:'synthetic-storage'};
             else if(action==='choose_diagnostics')result={path:'Synthetic report.json'};
@@ -116,6 +126,137 @@ class Release125UiTests(unittest.TestCase):
         self.assertEqual(set(page.evaluate('window.__payloads[0].sessions')),{'friend','sample@chatroom'})
         self.assertEqual(errors,[])
 
+    def test_completed_task_resource_help_shows_counts_on_hover_and_keyboard_focus(self):
+        tasks = [
+            dict(id='mixed', kind='export', category='sessions', title='有缺失资源的会话', status='completed',
+                 resource_summary=dict(available=41, missing=30, encrypted=2, unsupported=0, corrupt=1)),
+            dict(id='skipped', kind='export', category='sessions', title='仅跳过附件的会话', status='completed',
+                 resource_summary=dict(skipped=4)),
+        ]
+        page, errors = self.app(tasks=tasks)
+        page.locator('#nav-tasks').click()
+        hint = page.get_by_role('button',name='资源导出详情',exact=True)
+        self.assertEqual(hint.count(),1)
+        self.assertTrue(page.get_by_text('已跳过 4 项资源',exact=True).is_visible())
+        hint.hover()
+        tooltip = page.locator('[data-slot=tooltip-content]')
+        tooltip.wait_for(state='visible')
+        self.assertEqual(tooltip.locator('p').first.inner_text(),'已导出 41 个资源')
+        self.assertEqual(tooltip.locator('dt').all_inner_texts(),['缺失','加密','格式不支持','校验失败'])
+        self.assertEqual(tooltip.locator('dd').all_inner_texts(),['30','2','0','1'])
+        self.assertIn('重新连接并整理微信',tooltip.inner_text())
+        self.assertIn('恢复图片读取',tooltip.inner_text())
+        self.assertIn('重新下载',tooltip.inner_text())
+        page.mouse.move(10,10,steps=8)
+        tooltip.wait_for(state='hidden')
+        hint.focus()
+        tooltip.wait_for(state='visible')
+        page.keyboard.press('Escape')
+        tooltip.wait_for(state='hidden')
+        page.get_by_title('切换亮暗', exact=True).click()
+        page.wait_for_function("document.documentElement.classList.contains('dark')")
+        hint.hover()
+        tooltip.wait_for(state='visible')
+        expect(tooltip.locator('svg')).to_have_count(0)
+        self.assertEqual(tooltip.evaluate('el => getComputedStyle(el).borderBottomWidth'), '1px')
+        self.assertEqual(errors,[])
+
+    def test_task_file_details_are_visible_beyond_the_overview_list(self):
+        tasks = [
+            dict(id=f'export-{index}', kind='export', category='sessions',
+                 title=f'导出记录 {index}', status='completed', format='html')
+            for index in range(5)
+        ]
+        tasks[-1]['size_info'] = dict(
+            bytes=8 * 1024**2, source_db_bytes=64 * 1024**2,
+            resources=dict(image=1024, video=1024, audio=1024, file=1024, original=1024),
+        )
+        page, errors = self.app(viewport={'width': 1080, 'height': 900}, tasks=tasks)
+        trigger = page.get_by_role('button', name='8.0 MB', exact=True)
+        details = page.get_by_role('dialog', name='资源文件详情')
+        note = details.get_by_text('源数据库包含其他会话', exact=False)
+        note_receives_pointer = """line => {
+          const rect = line.getBoundingClientRect();
+          return line.contains(document.elementFromPoint(
+            rect.left + rect.width / 2, rect.top + rect.height / 2
+          ));
+        }"""
+
+        trigger.click()
+        page.locator('[role="dialog"][data-side="bottom"]').wait_for()
+        self.assertGreater(note.bounding_box()['y'], trigger.bounding_box()['y'])
+        self.assertTrue(note.evaluate(note_receives_pointer))
+        page.keyboard.press('Escape')
+        details.wait_for(state='hidden')
+        expect(trigger).to_be_focused()
+
+        page.set_viewport_size({'width': 1080, 'height': 680})
+        trigger.press('Enter')
+        page.locator('[role="dialog"][data-side="top"]').wait_for()
+        self.assertTrue(note.evaluate(note_receives_pointer))
+        page.locator('#nav-tasks').click()
+        details.wait_for(state='hidden')
+        trigger.click()
+        details.get_by_text('当前账号源数据库总量 64.0 MB', exact=True).wait_for()
+        self.assertTrue(note.evaluate(note_receives_pointer))
+        self.assertEqual(errors, [])
+
+    def test_export_completion_opens_the_task_folder_and_links_to_the_project(self):
+        old = dict(id='historical',kind='export',category='sessions',title='上一次运行的导出',status='completed')
+        page, errors = self.app(tasks=[old])
+        toaster = page.locator('[data-qce-toaster]')
+        completed = toaster.get_by_text('导出完成',exact=True)
+        self.assertEqual(completed.count(),0)
+        page.evaluate("""window.__fixtureTasks.unshift({
+            id:'fresh-download', kind:'export', category:'favorites', title:'刚完成的收藏', status:'completed'
+        })""")
+        completed.wait_for()
+        self.assertEqual(completed.count(),1)
+        self.assertIn('blur(5px)', toaster.locator('.toast-glass').evaluate('card=>getComputedStyle(card).backdropFilter'))
+        self.assertEqual(completed.evaluate('title=>getComputedStyle(title).filter'), 'none')
+        self.assertEqual(toaster.get_by_text('刚完成的收藏',exact=True).count(),0)
+        self.assertEqual(toaster.get_by_text('上一次运行的导出',exact=True).count(),0)
+        star = toaster.get_by_role('link',name='去 GitHub 给 Moect 点 Star',exact=True)
+        star.click()
+        page.wait_for_function("window.__exportActions.some(({action,payload})=>action==='source'&&payload.name==='project')")
+        action = toaster.get_by_role('button',name='打开文件位置',exact=True)
+        action.click()
+        page.wait_for_function("window.__exportActions.some(({action,payload})=>action==='open_task_folder'&&payload.id==='fresh-download')")
+        action.wait_for(state='hidden')
+        page.evaluate("""window.__fixtureTasks.unshift({
+            id:'second',kind:'export',category:'sessions',title:'另一次导出',status:'completed'
+        })""")
+        completed.wait_for()
+        self.assertEqual(toaster.get_by_text('另一次导出',exact=True).count(),0)
+        toaster.get_by_role('button',name='关闭',exact=True).click()
+        completed.wait_for(state='hidden')
+        self.assertEqual(errors,[])
+
+    def test_glass_notifications_overlap_until_hovered(self):
+        page, errors = self.app()
+        page.evaluate("""window.__fixtureTasks.unshift(...['first','second'].map(id=>({
+          id,kind:'export',category:'sessions',title:'Synthetic export',status:'completed'
+        })))""")
+        cards = page.locator('[data-qce-toaster] .toast-glass')
+        page.wait_for_function("""() => {
+          const [front, back] = document.querySelectorAll('.toast-glass');
+          if (!front || !back) return false;
+          const a = front.getBoundingClientRect(), b = back.getBoundingClientRect();
+          const frontStyle = getComputedStyle(front);
+          const style = getComputedStyle(back);
+          return front.hasAttribute('data-stack-front') && frontStyle.backdropFilter.includes('blur(3px)') &&
+                 frontStyle.getPropertyValue('--toast-glass-density').trim()==='75%' &&
+                 style.visibility==='visible' && style.backdropFilter.includes('blur(5px)') &&
+                 b.top<a.top && b.bottom>a.top;
+        }""")
+        cards.first.hover()
+        page.wait_for_function("""() => {
+          const [front, back] = document.querySelectorAll('.toast-glass');
+          return !front.hasAttribute('data-stack-front') && getComputedStyle(front).backdropFilter.includes('blur(5px)') &&
+                 back.getBoundingClientRect().bottom < front.getBoundingClientRect().top;
+        }""")
+        self.assertEqual(errors, [])
+
     def test_export_waits_for_preferences_before_enabling_start(self):
         page, errors = self.app()
         page.evaluate('''()=>{
@@ -134,9 +275,58 @@ class Release125UiTests(unittest.TestCase):
         page.wait_for_function('typeof window.__releaseArchivePreferences==="function"')
         page.evaluate('window.__releaseArchivePreferences()')
         page.wait_for_function('()=>Array.from(document.querySelectorAll("button")).some(b=>b.textContent==="开始批量导出"&&!b.disabled)')
+        page.get_by_role('button', name='最近 3 个月', exact=True).click()
         button.click()
         page.wait_for_function('window.__payloads.length===1')
+        self.assertEqual(page.evaluate('window.__payloads[0].timeRange'), 'recent')
+        self.assertEqual(page.evaluate('window.__payloads[0].start'), '')
         self.assertEqual(errors,[])
+
+    def test_custom_export_range_opens_calendar_in_one_click(self):
+        page, errors = self.app()
+        page.evaluate("window.__wce.chooseItems(['friend'])")
+        options = page.get_by_role('dialog', name='批量导出聊天记录')
+        calendar = page.get_by_role('dialog', name='选择时间范围（北京时间）')
+        custom = options.get_by_role('button', name='自定义', exact=True)
+        recent = options.get_by_role('button', name='最近 3 个月', exact=True)
+        recent.click()
+        custom.click()
+        calendar.wait_for()
+        self.assertEqual(options.get_by_role('button', name='选择时间范围', exact=True).count(), 0)
+        calendar.get_by_role('button', name='选择年份').click()
+        year_menu = calendar.get_by_role('listbox', name='选择年份')
+        year_menu.wait_for()
+        page.keyboard.press('Escape')
+        year_menu.wait_for(state='hidden')
+        expect(calendar).to_be_visible()
+        calendar.get_by_role('button', name='回到今天').click()
+        page.keyboard.press('Escape')
+        calendar.wait_for(state='hidden')
+        expect(recent).to_have_attribute('aria-pressed', 'true')
+        expect(custom).to_be_focused()
+
+        custom.press('Enter')
+        calendar.wait_for()
+        days = calendar.locator('.day')
+        first, last = days.nth(4), days.nth(10)
+        start, end = first.get_attribute('aria-label'), last.get_attribute('aria-label')
+        first.click()
+        last.click()
+        calendar.get_by_role('button', name='应用并确定').click()
+        expect(custom).to_have_attribute('aria-pressed', 'true')
+        expect(custom).to_be_focused()
+        expect(options.get_by_text(f'{start} 00:00 至 {end} 23:59', exact=True)).to_be_visible()
+
+        custom.click()
+        expect(calendar.locator('.day.edge')).to_have_count(2)
+        calendar.get_by_role('button', name='取消', exact=True).click()
+        expect(custom).to_have_attribute('aria-pressed', 'true')
+        options.get_by_role('button', name='开始批量导出', exact=True).click()
+        page.wait_for_function('window.__payloads.length===1')
+        payload = page.evaluate('window.__payloads[0]')
+        self.assertEqual((payload['timeRange'], payload['start'], payload['end']),
+                         ('custom', f'{start}T00:00', f'{end}T23:59'))
+        self.assertEqual(errors, [])
 
     def test_storage_limit_defaults_unlimited_and_remembers_keyboard_changes(self):
         page,errors = self.app()
@@ -518,7 +708,6 @@ class Release125UiTests(unittest.TestCase):
     def test_invalid_timestamp_and_failed_preference_save_keep_interface_usable(self):
         page, errors = self.app(invalid_timestamp=True)
         page.evaluate("window.__wce.chooseItems(['friend'])")
-        page.locator('summary').filter(has_text='更多设置').click()
         page.get_by_role('switch', name='使用密码加密压缩包', exact=True).click()
         page.get_by_label('压缩包密码', exact=True).fill('Synthetic unsaved password')
         page.evaluate('window.__failPreferences=true')
@@ -628,22 +817,26 @@ class Release125UiTests(unittest.TestCase):
     def test_archive_options_remember_password_presence_and_xlsx_reaches_backend(self):
         page, errors = self.app()
         page.evaluate("window.__wce.chooseItems(['friend'])")
-        more = page.locator('summary').filter(has_text='更多设置')
-        self.assertFalse(page.get_by_role('switch', name='导出为 ZIP 压缩包', exact=True).is_visible())
-        more.click()
-        self.assertTrue(more.locator('xpath=ancestor::section').get_by_role('heading', name='高级选项').is_visible())
-        encrypt = page.get_by_role('switch', name='使用密码加密压缩包', exact=True)
-        page.wait_for_function('() => window.__calls.includes("archive_preferences")')
+        dialog = page.get_by_role('dialog', name='批量导出聊天记录', exact=True)
+        expect(dialog.get_by_role('heading', name='高级选项', exact=True)).to_have_count(0)
+        for heading in ('导出路径', '关键词过滤'):
+            expect(dialog.get_by_role('heading', name=heading, level=2, exact=True)).to_be_visible()
+            expect(dialog.get_by_role('textbox', name=heading, exact=True)).to_be_visible()
+        packaging = dialog.get_by_role('region', name='压缩与加密', exact=True)
+        zip_switch = packaging.get_by_role('switch', name='导出为 ZIP 压缩包', exact=True)
+        encrypt = packaging.get_by_role('switch', name='使用密码加密压缩包', exact=True)
+        expect(zip_switch).to_be_visible()
+        expect(encrypt).to_be_visible()
+        expect(dialog.get_by_text('更多设置', exact=True)).to_have_count(0)
         encrypt.click()
         page.get_by_label('压缩包密码', exact=True).fill('synthetic-password')
         page.keyboard.press('Escape')
         page.get_by_role('dialog', name='批量导出聊天记录', exact=True).wait_for(state='hidden')
         page.wait_for_function('() => window.__prefs.has_password')
         page.evaluate("window.__wce.chooseItems(['friend'])")
-        page.locator('summary').filter(has_text='更多设置').click()
         page.wait_for_function('() => document.querySelector("input[type=password]")?.disabled===false')
-        self.assertTrue(page.get_by_role('switch', name='导出为 ZIP 压缩包', exact=True).is_checked())
-        self.assertTrue(page.get_by_role('switch', name='使用密码加密压缩包', exact=True).is_checked())
+        self.assertTrue(zip_switch.is_checked())
+        self.assertTrue(encrypt.is_checked())
         self.assertEqual(page.get_by_label('压缩包密码', exact=True).input_value(), '')
         self.assertEqual(page.get_by_label('压缩包密码', exact=True).get_attribute('placeholder'), '')
         page.get_by_role('button', name='XLSX', exact=True).click()
@@ -660,11 +853,22 @@ class Release125UiTests(unittest.TestCase):
             page.evaluate('(tab) => window.__wce.setTab(tab)', kind)
             export = page.get_by_role('button', name=export_label, exact=True)
             export.wait_for()
+            option_names = ('尝试下载本机尚未缓存的表情资源',) if kind == 'stickers' else ('导出图片', '导出本地视频')
+            for name in option_names:
+                option = page.get_by_role('checkbox', name=name, exact=True)
+                expect(option).to_be_checked()
+                option.press('Space')
+                expect(option).not_to_be_checked()
             more = page.get_by_role('button', name='更多设置', exact=True)
             self.assertEqual(page.get_by_role('switch', name='导出为 ZIP 压缩包', exact=True).count(), 0)
             export_box, more_box = export.bounding_box(), more.bounding_box()
             self.assertGreater(more_box['x'], export_box['x'])
             self.assertAlmostEqual(more_box['y'], export_box['y'], delta=2)
+            if kind == 'moments':
+                for name in option_names:
+                    box = page.get_by_role('checkbox', name=name, exact=True).bounding_box()
+                    self.assertGreaterEqual(box['x'], more_box['x'] + more_box['width'])
+                    self.assertAlmostEqual(box['y'] + box['height']/2, more_box['y'] + more_box['height']/2, delta=2)
             more.click()
             dialog = page.get_by_role('dialog', name='更多设置', exact=True)
             encrypt = dialog.get_by_role('switch', name='使用密码加密压缩包', exact=True)
@@ -683,6 +887,54 @@ class Release125UiTests(unittest.TestCase):
             page.wait_for_function('(kind) => window.__assetPayloads.some(payload => payload.kind===kind)', arg=kind)
             payload = page.evaluate('window.__assetPayloads.at(-1)')
             self.assertEqual((payload['archiveZip'], payload['archiveEncrypt']), (True, True))
+            for key in (('download',) if kind == 'stickers' else ('includeImages', 'includeVideos')):
+                self.assertIs(payload[key], False)
+        self.assertEqual(errors, [])
+
+    def test_moments_account_placeholder_and_dismissed_timeline_help(self):
+        page, errors = self.app()
+        page.locator('#nav-moments').click()
+        page.get_by_role('button', name='指定账号', exact=True).click()
+        author = page.get_by_label('选择或填写微信账号', exact=True)
+        help_text = '列表包含本机朋友圈缓存中出现的账号，重名时请选择具体 UID'
+        expect(author).to_have_attribute('placeholder', f'UID、微信号或可唯一匹配的昵称（{help_text}）')
+        expect(author).to_have_accessible_description(help_text)
+
+        timeline = page.get_by_role('button', name='公共朋友圈', exact=True)
+        timeline.click()
+        hint = page.get_by_text('导出当前账号平时可读取', exact=False)
+        close = page.get_by_role('button', name='不再显示公共朋友圈说明', exact=True)
+        expect(hint).to_be_visible()
+        close.click()
+        expect(hint).to_have_count(0)
+        page.locator('#nav-overview').click()
+        page.locator('#nav-moments').click()
+        timeline.click()
+        expect(close).to_have_count(0)
+        page.reload()
+        page.locator('#nav-moments').click()
+        timeline.click()
+        expect(hint).to_have_count(0)
+        expect(close).to_have_count(0)
+        self.assertEqual(errors, [])
+
+    def test_dismissing_favorites_help_is_remembered_separately(self):
+        page, errors = self.app()
+        page.get_by_role('button', name='收藏', exact=True).click()
+        close = page.get_by_role('button', name='不再显示收藏说明', exact=True)
+        hint = page.get_by_text('在电脑微信打开需要的收藏，再回到这里刷新。', exact=True)
+        expect(hint).to_be_visible()
+        close.click()
+        expect(hint).to_have_count(0)
+        page.locator('#nav-moments').click()
+        page.get_by_role('button', name='公共朋友圈', exact=True).click()
+        expect(page.get_by_role('button', name='不再显示公共朋友圈说明', exact=True)).to_be_visible()
+
+        page.reload()
+        page.locator('#nav-favorites').click()
+        expect(page.get_by_role('button', name='导出所选收藏', exact=True)).to_be_visible()
+        expect(hint).to_have_count(0)
+        expect(close).to_have_count(0)
         self.assertEqual(errors, [])
 
     def test_marked_explanatory_copy_is_removed(self):
@@ -1002,7 +1254,7 @@ class Release125UiTests(unittest.TestCase):
         page, errors=self.app(viewport={'width':2000,'height':1100})
         page.evaluate('''()=>{
           const invoke=window.pywebview.api.invoke;
-          const names=['鸢尾紫','晴空蓝','青瓷青','松叶绿','暖杏橙','蔷薇粉','朱砂红','雾山灰'];
+          const names=['鸢尾紫','晴空蓝','青瓷青','松叶绿','暖栗棕','蔷薇粉','朱砂红','雾山灰'];
           const colors=['#7456c8','#3466ba','#007486','#386c4c','#a15417','#a34076','#b72f43','#536670'];
           window.pywebview.api.invoke=async(action,payload)=>{
             const response=await invoke(action,payload);

@@ -11,8 +11,9 @@ from unittest.mock import patch
 
 from core.account_exporting import write_collection
 from core.data import Archive, validate_root
-from core.exporting import export_session
+from core.exporting import export_index, export_session
 from core.service import Service
+from core.themes import archive_viewer_template
 from tests.test_core import fixture, SESSION
 from tests.test_resources import ASSETS, PNG
 from wx4.decrypt import quick_check
@@ -300,9 +301,9 @@ class BatchQueueTests(unittest.TestCase):
                 raise TimeoutError('Synthetic export timed out')
             return index
 
-        with patch('core.service.psutil.cpu_count', return_value=4), \
-             patch('core.service.psutil.cpu_percent', return_value=10), \
-             patch('core.service.psutil.virtual_memory', return_value=memory), ThreadPoolExecutor(1) as coordinator:
+        with patch('core.streaming.psutil.cpu_count', return_value=4), \
+             patch('core.streaming.psutil.cpu_percent', return_value=10), \
+             patch('core.streaming.psutil.virtual_memory', return_value=memory), ThreadPoolExecutor(1) as coordinator:
             done = coordinator.submit(lambda: list(
                 self.service._run_export_batch(3, work, lambda: None, lambda: None)))
             try:
@@ -346,6 +347,23 @@ class OfflinePrintingTests(unittest.TestCase):
             expanded:[...root.querySelectorAll('details')].every(item=>item.open)};
         };''')
 
+    def test_batch_directory_heading_aligns_with_the_conversation_cards(self):
+        records = [
+            dict(name='合成会话', path=self.root/'chat-1'/'index.html', count=520, format='html'),
+            dict(name='很长的合成会话名称'*12, path=self.root/'chat-2'/'index.html', count=21, format='html'),
+        ]
+        export_index(self.root, records, directory=True, failures=['未导出的会话'])
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                self.page.set_viewport_size({'width': width, 'height': 900})
+                self.page.goto((self.root/'index.html').as_uri())
+                left_edges = self.page.locator('h1, body > p, h2, li').evaluate_all(
+                    'items => items.map(item => item.getBoundingClientRect().left)')
+                self.assertEqual(len(left_edges), 6)
+                self.assertEqual(len(set(left_edges)), 1)
+                self.assertGreaterEqual(left_edges[0], 16)
+                self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+
     def test_chat_prints_all_matching_pages_and_restores_the_visible_page(self):
         archive = Archive(fixture(self.root/'数据库', count=170))
         self.addCleanup(archive.close)
@@ -353,6 +371,9 @@ class OfflinePrintingTests(unittest.TestCase):
         result = export_session(archive, archive.sessions()[0], {'format': 'html', 'quickExport': True}, folder, ASSETS, lambda _: None, lambda: None)
         self.page.goto(Path(result['path']).as_uri())
         self.page.wait_for_function('() => !reading && total===170')
+        self.page.locator('#search').fill('message 169')
+        self.page.locator('#prev').click()
+        self.page.wait_for_function('() => !reading && page===1 && total===170')
         visible = self.page.locator('#messages').text_content()
         self.page.emulate_media(media='print')
         self.page.locator('#print').click()
@@ -362,11 +383,98 @@ class OfflinePrintingTests(unittest.TestCase):
         self.assertEqual(self.page.locator('#messages').text_content(), visible)
         self.assertEqual(self.page.locator('#moect-print-root').count(), 0)
         self.page.emulate_media(media='screen')
-        self.page.locator('#search').fill('message 169')
         self.page.locator('#go').click()
         self.page.wait_for_function('() => !reading && total===1')
         self.page.locator('#print').click()
         self.page.wait_for_function('() => !MoectPrint.busy && window.__printed.rows===1')
+        self.assertEqual(self.errors, [])
+
+    def test_chat_keeps_the_current_page_when_an_earlier_chunk_is_incomplete(self):
+        with closing(Archive(fixture(self.root/'数据库', count=580))) as archive:
+            folder = self.root/'导出'
+            folder.mkdir()
+            result = export_session(archive, archive.sessions()[0], {'format':'html','quickExport':True},
+                                    folder, ASSETS, lambda _: None, lambda: None)
+        viewer = Path(result['path'])
+        (viewer.parent/'c000001.js').write_text('window.__wxChunk=[];', encoding='utf-8')
+        self.page.goto(viewer.as_uri())
+        self.page.wait_for_function('() => !reading && page===7 && total===580')
+        self.assertEqual(self.page.locator('#notice').text_content(), '')
+        rows = self.page.locator('#messages').text_content()
+        self.page.get_by_role('button', name='第 1 页', exact=True).click()
+        self.page.wait_for_function('() => !reading && document.querySelector("#notice").textContent.includes("分片内容不完整")')
+        self.assertEqual(self.page.locator('#page').text_content(), '第 8 / 8 页')
+        self.assertEqual(self.page.locator('#messages').text_content(), rows)
+        self.assertTrue(self.page.locator('#go').is_enabled())
+        self.page.locator('#reset').click()
+        self.page.wait_for_function('() => !reading && !document.querySelector("#notice").textContent')
+        self.assertEqual(self.page.locator('#messages').text_content(), rows)
+        self.assertEqual(self.errors, [])
+
+    def test_chat_reference_jump_recovers_after_a_missing_target_and_highlights_the_original(self):
+        with closing(Archive(fixture(self.root/'引用数据库', count=170))) as archive:
+            messages = list(archive.messages(SESSION))
+            messages[-3].update(kind='chatrecord', forward={'title':'窄窗口合并转发','messages':[]})
+            messages[-2].update(kind='quote', text='定位测试（未收录）',
+                                _quote={'server_id':'12345678','content':'归档外的引用正文','type':1})
+            messages[-1].update(kind='quote', text='定位测试（已收录）', _quote={'server_id':'12'})
+            out = self.root/'引用导出'
+            out.mkdir()
+            with patch.object(archive, 'messages', return_value=iter(messages)):
+                result = export_session(archive, archive.sessions()[0], {'format':'html','quickExport':True},
+                                        out, ASSETS, lambda _: None, lambda: None)
+        self.page.goto(Path(result['path']).as_uri())
+        self.page.wait_for_function('() => !reading && total===170')
+        self.page.set_viewport_size({'width': 210, 'height': 900})
+        self.page.wait_for_function('''() => document.documentElement.scrollWidth === innerWidth &&
+            parseFloat(getComputedStyle(document.body).paddingBottom) >= document.querySelector('#archive-pagination').offsetHeight + 16''')
+        self.page.set_viewport_size({'width': 1000, 'height': 800})
+        self.page.locator('#search').fill('定位测试')
+        self.page.locator('#go').click()
+        self.page.wait_for_function('() => !reading && total===2')
+        self.page.locator('#messages .row').filter(has_text='未收录').get_by_role('button', name='查看原消息').click()
+        self.page.wait_for_function('() => !reading && document.querySelector("#notice").textContent.includes("原消息不在")')
+        self.assertEqual(self.page.locator('#search').input_value(), '定位测试')
+        self.assertEqual(self.page.locator('#messages .row').count(), 2)
+        self.page.locator('#messages .row').filter(has_text='已收录').get_by_role('button', name='查看原消息').click()
+        self.page.locator('#messages .row.focused[data-message-id="12"]').wait_for()
+        self.assertEqual(self.page.locator('#search').input_value(), '')
+        self.assertTrue(self.page.locator('#go').is_enabled())
+        self.assertEqual(self.errors, [])
+
+    def test_chat_preserves_text_links_and_opens_encoded_attachments_offline(self):
+        picture = '图片 #100%.png'
+        attachment = '附件 #100%.txt'
+        with closing(Archive(fixture(self.root/'附件数据库', count=1))) as archive:
+            message = next(archive.messages(SESSION))
+            message.update(text='见（https://example.org/a_(b)?x=1&y=2）。[微笑] 还有 https://) 保留原文',
+                           resources=[dict(kind='image', path=picture, status='available', role='main'),
+                                      dict(kind='file', path=attachment, name='原始文件.txt', status='available')])
+            out = self.root/'附件导出'
+            out.mkdir()
+            with patch.object(archive, 'messages', return_value=iter([message])), \
+                 patch('core.exporting.ResourceStore.enrich', side_effect=lambda row: row):
+                result = export_session(archive, archive.sessions()[0], {'format':'html'}, out,
+                                        ASSETS, lambda _: None, lambda: None)
+        viewer = Path(result['path'])
+        (viewer.parent/picture).write_bytes(PNG)
+        (viewer.parent/attachment).write_text('合成附件', encoding='utf-8')
+        self.page.goto(viewer.as_uri())
+        self.page.wait_for_function('() => !reading && total===1')
+        href = self.page.locator('#messages a[href^="https:"]').get_attribute('href')
+        self.assertEqual(href, 'https://example.org/a_(b)?x=1&y=2')
+        self.assertIn('https://) 保留原文', self.page.locator('#messages').text_content())
+        self.assertEqual(self.page.get_by_alt_text('[微笑]', exact=True).count(), 1)
+        picture_link = self.page.locator('#messages a').filter(has=self.page.get_by_alt_text('图片', exact=True))
+        picture_link.press('Enter')
+        self.page.wait_for_function('document.querySelector(".moect-image-viewer[open] img")?.naturalWidth > 0')
+        self.page.keyboard.press('Escape')
+        local_file = self.page.get_by_role('link', name='打开附件：原始文件.txt')
+        self.assertEqual(local_file.get_attribute('download'), '原始文件.txt')
+        with self.page.expect_popup() as pending:
+            local_file.click()
+        pending.value.locator('pre').get_by_text('合成附件').wait_for()
+        self.assertEqual(self.page.url, viewer.as_uri())
         self.assertEqual(self.errors, [])
 
     def test_chat_pagination_keeps_the_selected_colors_on_hover(self):
@@ -398,15 +506,22 @@ class OfflinePrintingTests(unittest.TestCase):
 
     def test_moments_link_is_content_width_and_print_honors_all_filtered_posts(self):
         (self.root/'image.png').write_bytes(PNG)
+        comment_image = '评论 #100%.png'
+        (self.root/comment_image).write_bytes(PNG)
         data = dict(category='moments', name='Synthetic Moments', owner={'name': 'Synthetic owner'},
                     notice='Local synthetic data', resource_summary={}, exported_at='2026-11-06',
                     items=[dict(id=str(index), author='friend', author_name='朋友', text='合成动态 ' + str(index),
                                 title='微信小视频', url='https://example.com/video', create_time=1800000000 + index,
                                 resources=[dict(kind='image', status='available', path='image.png')],
                                 likes=[], comments=[]) for index in range(65)])
+        data['items'][0]['comments'] = [dict(name='评论者', text='带图评论',
+            resources=[dict(kind='image', status='available', path=comment_image)])]
         write_collection(self.root, ASSETS, data)
         self.page.goto((self.root/'index.html').as_uri())
         self.page.wait_for_function("() => document.querySelectorAll('.post').length===60")
+        self.page.locator('a').filter(has=self.page.get_by_alt_text('评论图片或表情')).press('Enter')
+        self.page.wait_for_function('document.querySelector(".moect-image-viewer[open] img")?.naturalWidth > 0')
+        self.page.keyboard.press('Escape')
         width = self.page.locator('.post .link').first.evaluate('element=>element.getBoundingClientRect().width')
         self.assertLess(width, 180)
         self.page.locator('#print').click()
@@ -417,3 +532,51 @@ class OfflinePrintingTests(unittest.TestCase):
         self.page.locator('#print').click()
         self.page.wait_for_function('() => !MoectPrint.busy && window.__printed.posts===1')
         self.assertEqual(self.errors, [])
+
+    def test_asset_archives_share_chat_layout_and_show_invalid_jumps_with_header_collapsed(self):
+        for category, page_size, mode in (('moments', 60, 'dark'), ('favorites', 40, 'light')):
+            with self.subTest(category=category):
+                folder = self.root/category
+                folder.mkdir()
+                data = dict(name='离线样例', category=category, owner={'name': '示例用户'},
+                            notice='合成归档', exported_at='2026-11-25T19:00:00',
+                            theme={'mode': mode, 'accent': 'cyan'},
+                            items=[dict(id=str(n), author='friend', author_name='朋友', source='朋友',
+                                        type=1, type_name='文本', title=f'条目 {n}', text=f'样例 {n}',
+                                        create_time=1800000000+n)
+                                   for n in range(20*page_size)])
+                if category == 'moments':
+                    write_collection(folder, ASSETS, data)
+                else:
+                    template = archive_viewer_template(ASSETS, 'favorites.html', data['theme'])
+                    (folder/'index.html').write_text(template.replace('__FAVORITES__', json.dumps(data)), encoding='utf-8')
+                    (folder/'builtin-faces.js').write_text('', encoding='utf-8')
+                self.page.set_viewport_size({'width': 1200, 'height': 800})
+                self.page.goto((folder/'index.html').as_uri())
+                header, footer = self.page.locator('body > header'), self.page.locator('#archive-pagination')
+                self.assertEqual(header.evaluate('node => getComputedStyle(node).position'), 'sticky')
+                self.assertEqual(footer.evaluate('node => getComputedStyle(node).position'), 'fixed')
+                for bar in (header, footer):
+                    self.assertIn('blur(8px)', bar.evaluate('node => getComputedStyle(node).backdropFilter'))
+                title_x = self.page.locator('#title').bounding_box()['x']
+                entry_x = self.page.locator('#items article').first.bounding_box()['x']
+                self.assertAlmostEqual(title_x, entry_x, delta=1)
+                self.page.locator('#toggle-header').click()
+                self.assertEqual(self.page.locator('#toggle-header').get_attribute('aria-expanded'), 'false')
+                jump = self.page.locator('#page-jump')
+                jump.fill('21')
+                jump.press('Enter')
+                footer.get_by_text('请输入有效页码', exact=True).wait_for(timeout=2000)
+                self.assertEqual(jump.get_attribute('aria-invalid'), 'true')
+                self.assertEqual(footer.locator('#page').inner_text(), '第 1 / 20 页')
+                jump.fill('20')
+                jump.press('Enter')
+                self.assertEqual(footer.locator('#page').inner_text(), '第 20 / 20 页')
+                self.assertEqual(jump.get_attribute('aria-invalid'), None)
+                self.page.set_viewport_size({'width': 390, 'height': 800})
+                self.assertTrue(self.page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.page.locator('#toggle-header').click()
+                self.page.locator('#query').fill(f'样例 {20*page_size-1}')
+                self.assertEqual(footer.locator('#page').inner_text(), '第 1 / 1 页')
+                self.assertTrue(footer.locator('#page-jump-controls').is_hidden())
+                self.assertEqual(self.errors, [])

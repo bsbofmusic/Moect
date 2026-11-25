@@ -68,6 +68,7 @@ The Windows host uses pywebview (BSD), pythonnet (MIT), clr-loader and the Micro
 - Native draggable regions: https://github.com/MicrosoftEdge/WebView2Feedback/blob/main/specs/IsNonClientRegionSupportEnabled.md.
 - Pillow 12.0.0 and imageio-ffmpeg 0.6.0 provide format validation and local codec conversion. Their license notices are included. The FFmpeg binary distributed with imageio-ffmpeg is bundled without modification; upstream build/source information: https://github.com/imageio/imageio-ffmpeg .
 - pysilk-mod 1.6.4 provides local Tencent SILK decoding for browser-playable PCM WAV exports. Source: https://github.com/DCZYewen/Python-Silk-Module . Its BSD/MIT notices are retained in THIRD_PARTY_LICENSES/pysilk-mod-LICENSE.txt; the included Skype SILK SDK notice is retained separately. No audio is sent to an online conversion service.
+- pilk 0.2.4 (GPL-3.0) provides SILK packet-loss concealment for legacy recordings. Its package license and the Skype SILK SDK notice are included in the distribution. [Decoder source](https://github.com/foyoux/pilk) · [Reference workflow](https://github.com/qiuyenal/silk2mp3)
 
 ## Account resource format references
 

@@ -4,11 +4,38 @@ import ctypes.wintypes as wt
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from wx4 import key
 
 
 class WindowsInteropTests(unittest.TestCase):
+    def test_export_location_reveals_the_exact_task_file(self):
+        from core.service import Service
+        from edge_app import Api
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root/'exports'
+            service = Service(Path(__file__).resolve().parents[1]/'ui', root/'state')
+            try:
+                api = Api(service)
+                for name in ('single/chat.txt', 'batch/index.html', 'batch.zip'):
+                    target = output/name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.touch()
+                    task = {'id': name, 'kind': 'export', 'status': 'completed',
+                            'folder': str(target.parent), 'files': [{'path': str(target)}]}
+                    service.config['tasks'].append(task)
+                    with self.subTest(name=name), patch('edge_app.reveal_file') as reveal:
+                        self.assertEqual(api.invoke('open_task_folder', {'id': name}), {'result': {'ok': True}})
+                        reveal.assert_called_once_with(target.resolve())
+                with patch('edge_app.reveal_file') as reveal:
+                    self.assertIn('error', api.invoke('open_task_folder', {'id': 'missing'}))
+                    reveal.assert_not_called()
+            finally:
+                service.shutdown()
+
     def test_debug_privilege_accepts_64_bit_pseudo_handle(self):
         handle=key.kernel32.GetCurrentProcess()
         self.assertEqual(handle,ctypes.c_void_p(-1).value)

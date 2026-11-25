@@ -9,19 +9,28 @@ from datetime import datetime
 from pathlib import Path
 from posixpath import relpath
 from urllib.parse import quote
-from .streaming import BufferedTextWriter
+from .streaming import BufferedTextWriter, json_line
 from .resources import ResourceStore
 from .version import VERSION,APP_NAME
 from .export_options import export_preferences,is_system_message
-from .themes import theme_archive,archive_theme
+from .themes import theme_archive,archive_viewer_template,archive_theme
 from .inline_faces import ArchiveFaces
+from wx4 import WECHAT_TIME_ZONE
 
 FORMATS = {'html', 'json', 'jsonl', 'txt', 'csv', 'md', 'xlsx'}
+MARKDOWN_INLINE = re.compile(r'([\\\x60*_{}\[\]<>!#&|~])')
+MARKDOWN_BLOCK = re.compile(r'^([ ]{0,3})([=+-]|[0-9]{1,9}[.)])', re.MULTILINE)
+MARKDOWN_INDENT = re.compile(r'^[ \t]+(?=[^ \t\n])', re.MULTILINE)
+MARKDOWN_URL = re.compile(r"""https?://[^\s\x00-\x1f<>"`，。！？、；：“”]+""", re.IGNORECASE)
+CSV_FORMULA = re.compile(r'^[\s\ufeff]*[=+\-@＝＋－＠]')
+DECIMAL_ID = re.compile(r'-?[0-9]+')
+WINDOWS_DEVICE_NAMES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$',
+                        *(prefix + digit for prefix in ('COM', 'LPT') for digit in '123456789¹²³')}
 
 
 def safe_name(value):
-    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', value).strip(' .')[:70] or 'chat'
-    if text.split('.')[0].upper() in {'CON','PRN','AUX','NUL', *['COM'+str(i) for i in range(1,10)], *['LPT'+str(i) for i in range(1,10)]}:
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', value).strip(' .')[:70].rstrip(' .') or 'chat'
+    if text.partition('.')[0].rstrip().upper() in WINDOWS_DEVICE_NAMES:
         text = '_' + text
     return text
 
@@ -47,42 +56,96 @@ def clean(msg):
     return msg
 
 
+def message_tree(msg):
+    yield msg
+    if msg.get('quote'):
+        yield from message_tree(msg['quote'])
+    for child in (msg.get('forward') or {}).get('messages', []):
+        yield from message_tree(child)
+
+
 def portable_paths(msg,prefix):
-    if msg.get('avatar'):msg['avatar']=prefix+msg['avatar']
-    for resource in msg.get('resources',[]):resource['path']=prefix+resource['path']
-    if msg.get('quote'):portable_paths(msg['quote'],prefix)
-    for child in (msg.get('forward') or {}).get('messages',[]):portable_paths(child,prefix)
+    for item in message_tree(msg):
+        if item.get('avatar'):
+            item['avatar'] = prefix + item['avatar']
+        for resource in item.get('resources', []):
+            resource['path'] = prefix + resource['path']
+
+
+def markdown_escape(value):
+    text = MARKDOWN_INLINE.sub(r'\\\1', str(value))
+    return MARKDOWN_BLOCK.sub(lambda m: m[1] + m[2][:-1] + '\\' + m[2][-1], text)
+
+
+def markdown_text(value):
+    value = value.replace('\r\n', '\n').replace('\r', '\n')
+    parts = []
+    start = 0
+    for match in MARKDOWN_URL.finditer(value):
+        url = match[0].rstrip('.,:;!?）】')
+        for opening, closing in (('(', ')'), ('[', ']')):
+            surplus = min(url.count(closing) - url.count(opening), len(url) - len(url.rstrip(closing)))
+            if surplus > 0:
+                url = url[:-surplus]
+        if url.endswith('://'):
+            continue
+        parts.extend((markdown_escape(value[start:match.start()]), '<' + url + '>'))
+        start = match.start() + len(url)
+    parts.append(markdown_escape(value[start:]))
+    escaped = MARKDOWN_INDENT.sub(lambda match: '&#160;' * len(match[0].expandtabs(4)), ''.join(parts))
+    return escaped.replace('\n', '  \n')
+
+
+def markdown_attachment(label, path, image=False):
+    return ('!' if image else '') + '[' + markdown_escape(label) + '](<' + quote(path, safe='/') + '>)'
 
 
 def readable_text(msg,markdown=False):
-    text=msg.get('text','')
-    game=msg.get('extra',{}).get('game_emoji')
+    text=msg.get('text') or ''
+    extra=msg.get('extra') or {}
+    game=extra.get('game_emoji')
     if markdown and game and text=='['+game['label']+']' and any(
             r['kind']=='image' and r['status']=='available' for r in msg.get('resources',[])):
         text=''
-    quote=msg.get('quote')
-    if quote:
-        reference=readable_text(quote,markdown)
-        text+='\n'+(('> ' if markdown else '↳ ')+(quote.get('sender') or '')+': '+reference.replace('\n','\n> ' if markdown else '\n  '))
+    url = extra.get('url')
+    kind = msg.get('kind')
+    if kind in ('link', 'miniprogram'):
+        details = [extra.get('description')]
+        if isinstance(url, str) and url.lower().startswith(('https://', 'http://')):
+            details.append(url)
+        if kind == 'miniprogram':
+            mini = extra.get('miniprogram') or {}
+            details.extend(mini.get(key) for key in ('appid', 'username', 'page_path'))
+        for detail in details:
+            if isinstance(detail, str) and detail and detail not in text:
+                text += ('\n' if text else '') + detail
+    display = markdown_escape if markdown else str
+    if markdown:
+        text = markdown_text(text)
+    separator = '\n\n' if markdown else '\n'
+    reply=msg.get('quote')
+    if reply:
+        reference=readable_text(reply,markdown)
+        text+=separator+(('> ' if markdown else '↳ ')+display(reply.get('sender') or '')+': '+reference.replace('\n','\n> ' if markdown else '\n  '))
     forward=msg.get('forward')
     if forward:
-        text+='\n【'+forward.get('title','转发的聊天记录')+'】'
+        text+=separator+'【'+display(forward.get('title','转发的聊天记录'))+'】'
         for child in forward.get('messages',[]):
-            text+='\n['+child.get('time_str','')+'] '+child.get('sender','')+'\n'+readable_text(child,markdown)
-        if forward.get('notice'):text+='\n'+forward['notice']
+            text+=separator+'['+display(child.get('time_str',''))+'] '+display(child.get('sender',''))+('  \n' if markdown else '\n')+readable_text(child,markdown)
+        if forward.get('notice'):text+=separator+display(forward['notice'])
     for resource in msg.get('resources',[]):
         path=resource['path']
         if markdown:
             label='图片' if resource['kind']=='image' else resource['name']
-            text+='\n'+('!' if resource['kind']=='image' and resource['status']=='available' else '')+'['+label.replace(']','')+'](<'+path+'>)'
+            text+=separator+markdown_attachment(label,path,resource['kind']=='image' and resource['status']=='available')
         else:text+='\n'+path
-    if msg.get('resource_notice'):text+='\n'+msg['resource_notice']
+    if msg.get('resource_notice'):text+=separator+display(msg['resource_notice'])
     return text
 
 
 def csv_cell(value):
     value = str(value)
-    return "'" + value if value.lstrip().startswith(('=', '+', '-', '@')) else value
+    return "'" + value if CSV_FORMULA.match(value) else value
 
 
 def write_html_chunks(folder, filename_prefix, records, progress=lambda _: None):
@@ -183,8 +246,8 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                 yield message
         meta = dict(application=APP_NAME, version=VERSION, session=session['username'],
                     theme=archive_theme(options.get('_theme')),
-                    name=title, exported_at=datetime.now().isoformat(timespec='seconds'),
-                    time_zone='Asia/Shanghai',
+                    name=title, exported_at=datetime.now(WECHAT_TIME_ZONE).replace(tzinfo=None).isoformat(timespec='seconds'),
+                    time_zone=WECHAT_TIME_ZONE.tzname(None),
                     export_options=preferences,
                     demo=bool(options.get('demo')), filters={k: options[k] for k in ('query','kind','start','end') if k in options})
         # Like QCE's text exporter, source iteration is separate from rendering; each
@@ -194,12 +257,13 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
             path = folder/(stem + '.xlsx')
             def prepare(message):
                 portable_paths(message, out.name + '/')
-                attachments = '\n'.join(resource['path'] for resource in message.get('resources', []) if resource.get('path'))
+                attachments = list(dict.fromkeys(resource['path'] for item in message_tree(message)
+                    for resource in item.get('resources', []) if resource.get('path')))
                 return readable_text(message), attachments
             count = write_excel(path, records(), title, prepare, progress, cancel)
         elif fmt == 'html':
             faces = ArchiveFaces(viewer_assets, cancel)
-            template = theme_archive((viewer_assets / 'viewer.html').read_text(encoding='utf-8'),meta['theme']).replace('__DATE_RANGE_PICKER__',(viewer_assets/'date-range-picker.js').read_text(encoding='utf-8')).replace('__ARCHIVE_PRINT__',(viewer_assets/'archive-print.js').read_text(encoding='utf-8')).replace('__ARCHIVE_MEDIA__',(viewer_assets/'archive-media.js').read_text(encoding='utf-8')).replace('__INLINE_FACES__',(viewer_assets/'inline-faces.js').read_text(encoding='utf-8'))
+            template = archive_viewer_template(viewer_assets, 'viewer.html', meta['theme'])
             if batch:
                 link = '<div id="header-content"><p><a href="../index.html">返回会话目录</a></p>'
                 template = template.replace('<div id="header-content">', link, 1)
@@ -220,9 +284,10 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
             path = folder / (stem + '.' + fmt)
             with BufferedTextWriter(path, encoding='utf-8-sig' if fmt=='csv' else 'utf-8') as writer:
                 if fmt=='json': writer.write('{"metadata":' + json.dumps(meta, ensure_ascii=False) + ',"messages":[')
-                if fmt=='jsonl': writer.write(json.dumps({'metadata':meta}, ensure_ascii=False)+'\n')
+                if fmt=='jsonl': writer.write(json_line({'metadata':meta}))
                 if fmt in ('txt','md'):
-                    writer.write(('# ' if fmt=='md' else '') + title + '\n' + ('演示数据 · ' if meta['demo'] else '') + '由 '+APP_NAME+' 导出\n\n')
+                    heading = '# ' + markdown_escape(title) if fmt=='md' else title
+                    writer.write(heading + '\n' + ('演示数据 · ' if meta['demo'] else '') + '由 '+APP_NAME+' 导出\n\n')
                 if fmt=='csv':
                     csv_writer = csv.writer(writer)
                     csv_writer.writerow(['时间','会话','发送者','类型','内容','消息ID'])
@@ -233,13 +298,18 @@ def export_session(archive, session, options, folder, viewer_assets, progress, c
                     portable_paths(msg,prefix)
                     if fmt=='json':
                         writer.write((',' if count else '') + json.dumps(clean(msg), ensure_ascii=False))
-                    elif fmt=='jsonl': writer.write(json.dumps(clean(msg), ensure_ascii=False)+'\n')
+                    elif fmt=='jsonl': writer.write(json_line(clean(msg)))
                     elif fmt=='csv':
-                        csv_writer.writerow([csv_cell(v) for v in [msg['time_str'], title, msg['sender'], msg['type_name'],
-                                                                   readable_text(msg), msg['server_id']]])
+                        identifier = str(msg['server_id'])
+                        fields = (msg['time_str'], title, msg['sender'], msg['type_name'], readable_text(msg))
+                        csv_writer.writerow([*(csv_cell(v) for v in fields),
+                                             identifier if DECIMAL_ID.fullmatch(identifier) else csv_cell(identifier)])
+                    elif fmt=='md':
+                        sender = markdown_escape(msg['sender'])
+                        stamp = markdown_escape(msg['time_str'])
+                        writer.write(f"[{stamp}] {sender}  \n{readable_text(msg,markdown=True)}\n\n")
                     else:
-                        text=readable_text(msg,fmt=='md')
-                        writer.write(f"[{msg['time_str']}] {msg['sender']}\n{text}\n\n")
+                        writer.write(f"[{msg['time_str']}] {msg['sender']}\n{readable_text(msg)}\n\n")
                     count += 1
                     if count % 200 == 0: progress(count)
                 if fmt=='json': writer.write('],"count":'+str(count)+'}')
@@ -282,7 +352,14 @@ def export_index(folder, records, demo=False,theme=None, *, directory=False, fai
     links = ''.join('<li><a href="%s">%s</a><span>%s 条 · %s</span></li>' %
                     (html.escape(quote(Path(r['path']).relative_to(folder).as_posix(),safe='/'), quote=True),
                      html.escape(r['name']), r['count'], r['format'].upper()) for r in records)
-    content = '<!doctype html><meta charset="utf-8"><title>聊天记录归档</title><style>body{font:15px system-ui;max-width:850px;margin:70px auto;background:#f7f5fb;color:#292137}h1{font-size:32px}li{display:flex;justify-content:space-between;padding:20px;background:white;margin:10px 0;border-radius:12px}a{color:#7056c4;text-decoration:none}span{color:#7e718f}</style>'
+    content = ('<!doctype html><meta charset="utf-8">'
+               '<meta name="viewport" content="width=device-width, initial-scale=1">'
+               '<title>聊天记录归档</title><style>'
+               'body{font:15px system-ui;max-width:850px;margin:70px auto;padding-inline:16px;background:#f7f5fb;color:#292137}'
+               'h1{font-size:32px}ul{padding:0;list-style:none}'
+               'li{display:flex;justify-content:space-between;gap:12px;padding:20px;background:white;margin:10px 0;border-radius:12px;overflow-wrap:anywhere}'
+               'a{color:#7056c4;text-decoration:none}span{color:#7e718f;flex-shrink:0}'
+               '</style>')
     content += '<h1>聊天记录归档' + (' · 演示数据' if demo else '') + '</h1><p>'+APP_NAME+' · 本地归档</p><ul>' + links + '</ul>'
     if failures:
         content += '<h2>未能导出的会话</h2><ul>' + ''.join(

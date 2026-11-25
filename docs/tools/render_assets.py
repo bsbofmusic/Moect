@@ -20,7 +20,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
 from core.service import Service  # noqa: E402
 from core.version import VERSION  # noqa: E402
-from core.themes import ACCENTS  # noqa: E402
+from core.themes import ACCENTS, archive_viewer_template  # noqa: E402
 
 
 def avatar(label,color):
@@ -70,7 +70,7 @@ def fixtures(raw):
     manifest={'name':'周末出走计划','demo':True,'count':len(rows),'exported_at':'2026-10-30',
         'chunks':[{'file':'sample.js','count':len(rows)}]}
     (raw/'sample.js').write_text('window.__wxChunk='+json.dumps(rows,ensure_ascii=False)+';',encoding='utf-8')
-    template=(ROOT/'ui/viewer.html').read_text(encoding='utf-8').replace('__DATE_RANGE_PICKER__',(ROOT/'ui/date-range-picker.js').read_text(encoding='utf-8')).replace('__ARCHIVE_PRINT__',(ROOT/'ui/archive-print.js').read_text(encoding='utf-8')).replace('__ARCHIVE_MEDIA__',(ROOT/'ui/archive-media.js').read_text(encoding='utf-8'))
+    template=archive_viewer_template(ROOT/'ui','viewer.html')
     (raw/'viewer.html').write_text(template.replace('__MANIFEST__',json.dumps(manifest,ensure_ascii=False)),encoding='utf-8')
     landscapes=[]
     schemes=[('#a8b6d6','#f0d7c3','#5b657d'),('#a7c1ba','#e9dfc4','#53736c'),('#b5add3','#ead4dc','#75628d'),
@@ -92,7 +92,7 @@ def fixtures(raw):
                   'resources':[{'kind':'image','status':'available','path':f'landscape-{i}.svg'} for i in range(9)],
                   'likes':[{'uid':'demo_friend_'+str(i),'name':name,'avatar':f'avatar{i%2}.svg'} for i,name in enumerate(['陈一','小满','沈河','阿柚','周周'])],
                   'comments':[{'uid':'demo_chen','name':'陈一','avatar':'avatar1.svg','text':'这一组配色，好像周末的心情。'},{'uid':'demo_me','name':'林间','avatar':'avatar0.svg','reply_name':'陈一','text':'下次一起去走走吧。'}]}]}
-    template=(ROOT/'ui/collection.html').read_text(encoding='utf-8').replace('__DATE_RANGE_PICKER__',(ROOT/'ui/date-range-picker.js').read_text(encoding='utf-8')).replace('__ARCHIVE_PRINT__',(ROOT/'ui/archive-print.js').read_text(encoding='utf-8')).replace('__ARCHIVE_MEDIA__',(ROOT/'ui/archive-media.js').read_text(encoding='utf-8'))
+    template=archive_viewer_template(ROOT/'ui','collection.html')
     (raw/'moments-viewer.html').write_text(template.replace('__COLLECTION__',json.dumps(collection,ensure_ascii=False)),encoding='utf-8')
     return {'state':state,'sessions':sessions,'preview':preview,'moments':moments,'stickers':stickers}
 

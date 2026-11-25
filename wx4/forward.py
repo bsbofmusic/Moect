@@ -2,6 +2,7 @@
 import hashlib
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from . import WECHAT_TIME_ZONE
 
 
 def build_forward(data,parent,limit=5000,depth=0,budget=None):
@@ -45,9 +46,9 @@ def build_forward(data,parent,limit=5000,depth=0,budget=None):
             if timestamp>10**12:timestamp//=1000
             if not 0<timestamp<253402300800:raise ValueError()
         except (ValueError,TypeError):
-            try:timestamp=int(datetime.strptime(time_text,'%Y-%m-%d %H:%M:%S').timestamp())
+            try:timestamp=int(datetime.strptime(time_text,'%Y-%m-%d %H:%M:%S').replace(tzinfo=WECHAT_TIME_ZONE).timestamp())
             except (ValueError,OverflowError):timestamp=int(parent.get('create_time') or 0)
-        try:display_time=datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else time_text
+        try:display_time=datetime.fromtimestamp(timestamp,WECHAT_TIME_ZONE).strftime('%Y-%m-%d %H:%M:%S') if timestamp else time_text
         except (ValueError,OSError,OverflowError):timestamp=0;display_time=time_text
         source=ET.tostring(item,encoding='unicode')
         identifier=_txt(item,'fromnewmsgid') or item.attrib.get('dataid') or str(index)

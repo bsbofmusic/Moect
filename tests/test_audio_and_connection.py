@@ -48,9 +48,10 @@ class AudioTests(unittest.TestCase):
     def test_truncated_or_excessive_silk_is_rejected_before_native_decode(self):
         blob=silk_fixture()
         invalid=(blob[:-1],b'\x02#!SILK_V3\xff\x7f',b'\x02#!SILK_V3'+b'\0\0'*30001,
-                 blob+b'\0\0'+blob[10:],blob+b'\0'*258,blob+b'\x00',blob+b'\xfe\xff',
+                 blob+b'\0\0'+blob[10:-1],blob+b'\0'*258,blob+b'\x01',blob+b'\xfe\xff',
                  b'\x02#!SILK_V3'+struct.pack('<h',1251)+b'x'*1251)
-        with patch('pysilk.decode',side_effect=AssertionError('Invalid packets reached native decoder')):
+        with patch('pysilk.decode',side_effect=AssertionError('Invalid packets reached native decoder')), \
+             patch('pilk.decode',side_effect=AssertionError('Invalid packets reached compatibility decoder')):
             for source in invalid:
                 self.assertIsNone(self.codec.audio(source,self.root/'bad.wav'))
                 self.assertEqual(self.codec.audio_reason,'invalid_silk_packets')
@@ -63,13 +64,15 @@ class AudioTests(unittest.TestCase):
                 standard = blob[1:]
                 variants = (blob, standard, standard + b'\xff\xff', blob + b'\0' * 12,
                             blob[:10] + b'\n' + blob[10:],
-                            standard[:9] + b'\r\n' + standard[9:] + b'\xff\xff')
+                            standard[:9] + b'\r\n' + standard[9:] + b'\xff\xff',
+                            blob + b'\xff\xff' + b'cache trailer')
                 for number, source in enumerate(variants):
                     with self.subTest(rate=rate, duration=duration, variant=number):
-                        stream, packets = silk_stream(source, lambda: None)
+                        stream, packets, has_loss, leading_loss = silk_stream(source, lambda: None)
                         self.assertTrue(stream.startswith(b'\x02#!SILK_V3'))
                         self.assertTrue(stream.endswith(b'\xff\xff'))
                         self.assertEqual(packets, duration // 20)
+                        self.assertEqual((has_loss, leading_loss), (False, 0))
                         target = self.root/'normalized.wav'
                         self.assertEqual(self.codec.audio(source, target), target)
                         self.assertEqual(self.codec.audio_reason, '')
@@ -87,7 +90,7 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(self.codec.audio_reason, '')
 
     def test_old_silk_zero_padding_is_independent_of_clip_duration_and_filename(self):
-        for padding in (2, 6, 12, 38, 128, 256):
+        for padding in (1, 2, 5, 6, 12, 38, 128, 255, 256):
             for duration in (20, 120, 520):
                 blob = silk_fixture(duration, sample_rate=16000)
                 with self.subTest(padding=padding, duration=duration):
@@ -95,6 +98,30 @@ class AudioTests(unittest.TestCase):
                     self.assertEqual(self.codec.audio(blob + b'\0' * padding, target), target)
                     with wave.open(str(target), 'rb') as audio:
                         self.assertEqual(audio.getnframes(), 24 * duration)
+
+    def test_legacy_silk_loss_markers_keep_later_audio_and_correct_duration(self):
+        for rate in (8000, 16000, 24000):
+            blob = silk_fixture(200, rate)
+            first_packet_end = 12 + struct.unpack_from('<h', blob, 10)[0]
+            for position in (10, first_packet_end, len(blob)):
+                with self.subTest(rate=rate, position=position):
+                    source = blob[:position] + b'\0\0'*2 + blob[position:] + b'\xff\xff'
+                    stream, packets, has_loss, leading_loss = silk_stream(source, lambda: None)
+                    if position == 10:
+                        self.assertEqual((packets,has_loss,leading_loss), (10,False,2))
+                        self.assertEqual(stream,blob + b'\xff\xff')
+                    else:
+                        self.assertEqual((packets,has_loss,leading_loss), (12,True,0))
+                        self.assertEqual(stream,source)
+                    target = self.root/'recovered.wav'
+                    self.assertEqual(self.codec.audio(source,target),target)
+                    with wave.open(str(target),'rb') as audio:
+                        self.assertEqual(audio.getnframes(), 5760)
+                        if leading_loss:
+                            self.assertEqual(audio.readframes(960),bytes(1920))
+                        audio.setpos(4*480)
+                        pcm = audio.readframes(480*4)
+                        self.assertGreater(max(abs(sample) for sample, in struct.iter_unpack('<h', pcm)), 100)
 
     def test_export_and_forward_voice_are_wav_and_failed_conversion_is_reported(self):
         lib=media_fixture(self.root)
@@ -106,7 +133,9 @@ class AudioTests(unittest.TestCase):
                 forward=dict(original,server_id='forward',kind='chatrecord',forward={'title':'Synthetic forward','messages':[dict(voice,server_id='nested-voice')]})
                 for bad in (False,True):
                     folder=self.root/('bad' if bad else 'good');folder.mkdir()
-                    with patch.object(archive,'messages',side_effect=lambda *a,**k:iter([voice] if bad else [voice,forward])),patch.object(archive.data,'voice_blobs',side_effect=lambda *a:iter([b'\x02#!SILK_V3\xff\x7f' if bad else silk_fixture()])):
+                    blob = silk_fixture()
+                    source = b'\x02#!SILK_V3\xff\x7f' if bad else blob + b'\0\0\xff\xff'
+                    with patch.object(archive,'messages',side_effect=lambda *a,**k:iter([voice] if bad else [voice,forward])),patch.object(archive.data,'voice_blobs',side_effect=lambda *a:iter([source])):
                         result=export_session(archive,archive.sessions()[0],{'format':'json','includeAvatars':False},folder,ASSETS,lambda _:None,lambda:None)
                     rows=json.loads(Path(result['path']).read_text(encoding='utf-8'))['messages']
                     if bad:
@@ -121,7 +150,7 @@ class AudioTests(unittest.TestCase):
                         for row in (rows[0],rows[1]['forward']['messages'][0]):
                             resource=row['resources'][0]
                             self.assertEqual((resource['kind'],resource['status']),('audio','available'))
-                            with wave.open(str(folder/resource['path']),'rb') as audio:self.assertGreater(audio.getnframes(),0)
+                            with wave.open(str(folder/resource['path']),'rb') as audio:self.assertEqual(audio.getnframes(),5280)
             finally:archive.close()
 
 

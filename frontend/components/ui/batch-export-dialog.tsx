@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useId } from "react"
 import { call } from "@/src/native"
 import {ArchiveOptions,useArchivePreferences} from "@/src/ArchiveOptions"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
@@ -10,7 +10,7 @@ import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { DateRangePicker } from "@/components/ui/date-range-picker"
-import { CheckCircle2, XCircle, Users, User, FolderOpen, HelpCircle, ChevronDown } from "lucide-react"
+import { CheckCircle2, XCircle, Users, User, FolderOpen, HelpCircle } from "lucide-react"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip"
 import { Loader } from "@/components/ui/loader"
@@ -84,6 +84,8 @@ function ExportSwitch({id,title,description,checked,disabled,onChange}:{id:strin
 
 export function BatchExportDialog({ open, onOpenChange, items, onExport }: BatchExportDialogProps) {
   const didInitRef = useRef(false)
+  const pathHeadingId = useId()
+  const keywordsHeadingId = useId()
   const [format, setFormat] = useState<'HTML' | 'TXT' | 'JSON' | 'CSV' | 'JSONL' | 'MD' | 'XLSX'>('HTML')
   const [timeRange, setTimeRange] = useState<'all' | 'recent' | 'custom'>('all')
   const [customStartDate, setCustomStartDate] = useState('')
@@ -236,6 +238,10 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
     <Dialog open={open} onOpenChange={handleClose}>
       <DialogContent
         fullScreen
+        onEscapeKeyDown={event => {
+          // Let the nested native calendar handle Escape before this dialog.
+          if (event.composedPath().some(target => target instanceof HTMLDialogElement && target.open)) event.preventDefault()
+        }}
         overlayClassName="bg-background/80 dark:bg-background/80"
         className="inset-x-4 top-14 bottom-4 w-auto h-auto rounded-[24px] shadow-[0_20px_60px_-15px_rgba(0,0,0,0.14)] dark:shadow-[0_24px_80px_rgba(0,0,0,0.5)] overflow-hidden flex flex-col p-0"
       >
@@ -343,42 +349,47 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
                     </TooltipContent>
                   </Tooltip>
                 </h2>
-                <div className="space-y-4">
+                <div className="space-y-2">
                   <div className="inline-flex items-center flex-wrap gap-1 p-1 rounded-[20px] bg-black/[0.04] dark:bg-white/[0.06] w-fit max-w-full">
-                    {[
+                    {([
                       { value: 'all', label: '全部消息' },
                       { value: 'recent', label: '最近 3 个月' },
-                      { value: 'custom', label: '自定义' }
-                    ].map((option) => {
+                    ] as const).map((option) => {
                       const active = timeRange === option.value
                       return (
                         <button
                           key={option.value}
                           type="button"
                           disabled={isExporting}
+                          aria-pressed={active}
                           className={[
                             "px-5 h-[30px] text-[13px] font-medium rounded-full transition-all",
                             active
                               ? "bg-white dark:bg-white/10 text-foreground shadow-[0_1px_2px_rgba(0,0,0,0.06)]"
                               : "text-muted-foreground hover:text-foreground"
                           ].join(" ")}
-                          onClick={() => !isExporting && setTimeRange(option.value as 'all' | 'recent' | 'custom')}
+                          onClick={() => setTimeRange(option.value)}
                         >
                           {option.label}
                         </button>
                       )
                     })}
+                    <DateRangePicker
+                      className="export-date-segment"
+                      triggerLabel="自定义"
+                      pressed={timeRange === 'custom'}
+                      disabled={isExporting}
+                      startTime={customStartDate}
+                      endTime={customEndDate}
+                      onChange={(start, end) => {
+                        setCustomStartDate(start)
+                        setCustomEndDate(end)
+                        setTimeRange(current => start && end ? 'custom' : current === 'custom' ? 'all' : current)
+                      }}
+                    />
                   </div>
-                  {timeRange === 'custom' && (
-                    <div className="space-y-2">
-                      <DateRangePicker
-                        startTime={customStartDate}
-                        endTime={customEndDate}
-                        onChange={(start, end) => { setCustomStartDate(start); setCustomEndDate(end) }}
-                      />
-                      {dateError && <div className="text-[13px] text-red-600 dark:text-red-400">{dateError}</div>}
-                    </div>
-                  )}
+                  {timeRange === 'custom' && <p className="text-xs text-muted-foreground tabular-nums">{customStartDate.replace('T',' ')} 至 {customEndDate.replace('T',' ')}</p>}
+                  {timeRange === 'custom' && dateError && <p role="alert" className="text-[13px] text-red-600 dark:text-red-400">{dateError}</p>}
                 </div>
               </section>
 
@@ -398,31 +409,21 @@ export function BatchExportDialog({ open, onOpenChange, items, onExport }: Batch
                 </div>
               </section>
 
-              {/* 高级选项 */}
-              <section>
-                <h2 className={SECTION_TITLE}>高级选项</h2>
-                <div className="space-y-6">
-                  <div className="space-y-2.5">
-                    <label className="block text-[12px] font-medium text-muted-foreground pl-1">导出路径</label>
-                    <div className="flex gap-2">
-                      <Input placeholder="使用设置中的导出目录，可点击右侧文件夹更改" value={outputDir} readOnly disabled={isExporting} className={PILL_INPUT + " flex-1"} />
-                      <Button variant="outline" size="icon" disabled={isExporting} className="rounded-full shrink-0" title="选择文件夹" onClick={async () => { const result = await call("choose_output"); if (!result.cancelled) setOutputDir(result.export_dir) }}><FolderOpen className="w-4 h-4" /></Button>
-                    </div>
+              <div className="space-y-6">
+                <section>
+                  <h2 id={pathHeadingId} className={SECTION_TITLE}>导出路径</h2>
+                  <div className="flex gap-2">
+                    <Input aria-labelledby={pathHeadingId} placeholder="使用设置中的导出目录，可点击右侧文件夹更改" value={outputDir} readOnly disabled={isExporting} className={PILL_INPUT + " flex-1"} />
+                    <Button variant="outline" size="icon" disabled={isExporting} className="rounded-full shrink-0" title="选择文件夹" onClick={async () => { const result = await call("choose_output"); if (!result.cancelled) setOutputDir(result.export_dir) }}><FolderOpen className="w-4 h-4" /></Button>
                   </div>
+                </section>
 
-                  <div className="space-y-2.5">
-                    <label className="block text-[12px] font-medium text-muted-foreground pl-1">关键词过滤</label>
-                    <Textarea placeholder="输入关键词或发送者，留空导出全部" value={keywords} onChange={(e) => setKeywords(e.target.value)} disabled={isExporting} rows={2} className={PILL_TEXTAREA + " w-full"} />
-                  </div>
-                  <details className="group/archive-settings">
-                    <summary className="flex w-fit cursor-pointer list-none items-center gap-2 rounded-full bg-muted/60 px-4 py-2 text-[13px] font-medium hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden">
-                      更多设置
-                      <ChevronDown className="h-3.5 w-3.5 transition-transform group-open/archive-settings:rotate-180" />
-                    </summary>
-                    <div className="mt-4"><ArchiveOptions model={packaging} disabled={isExporting}/></div>
-                  </details>
-                </div>
-              </section>
+                <section>
+                  <h2 id={keywordsHeadingId} className={SECTION_TITLE}>关键词过滤</h2>
+                  <Textarea aria-labelledby={keywordsHeadingId} placeholder="输入关键词或发送者，留空导出全部" value={keywords} onChange={(e) => setKeywords(e.target.value)} disabled={isExporting} rows={2} className={PILL_TEXTAREA + " w-full"} />
+                </section>
+                <ArchiveOptions model={packaging} disabled={isExporting}/>
+              </div>
 
               {/* 导出进度 */}
               {progress.status === 'running' && (

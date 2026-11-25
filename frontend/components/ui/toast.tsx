@@ -7,6 +7,7 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { AnimatePresence, motion } from "framer-motion"
 import { X } from "lucide-react"
+import "./toast.css"
 
 export type ToastType = "info" | "success" | "warning" | "error" | "loading"
 export type ToastPosition =
@@ -49,9 +50,7 @@ export interface ToastTheme {
   border: string
   textPrimary: string
   textSecondary: string
-  buttonBg: string
   buttonText: string
-  buttonHover: string
   closeButton: string
   closeButtonHover: string
   dismissButtonHover: string
@@ -78,6 +77,21 @@ export interface ToastAnimation {
   transition: any
 }
 
+const glassToastTheme: ToastTheme = {
+  name: "macOS Glass",
+  background: "toast-glass",
+  border: "",
+  textPrimary: "text-card-foreground",
+  textSecondary: "text-card-foreground/90",
+  buttonText: "text-card-foreground",
+  closeButton: "text-muted-foreground",
+  closeButtonHover: "hover:text-black/70 hover:bg-black/5",
+  dismissButtonHover: "hover:text-black/70 hover:bg-black/5",
+  shadow: "",
+  spinner: "text-black/50",
+  borderRadius: "rounded-[20px]",
+}
+
 export const themes: Record<string, { name: string; light: ToastTheme; dark: ToastTheme }> = {
   default: {
     name: "Default (Glass)",
@@ -87,9 +101,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-white/40",
       textPrimary: "text-black/90",
       textSecondary: "text-black/60",
-      buttonBg: "bg-black/90",
       buttonText: "text-white",
-      buttonHover: "hover:bg-black",
       closeButton: "text-black/30",
       closeButtonHover: "hover:text-black/70 hover:bg-black/5",
       dismissButtonHover: "hover:text-black hover:bg-black/5",
@@ -102,9 +114,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-white/5",
       textPrimary: "text-zinc-100",
       textSecondary: "text-zinc-400",
-      buttonBg: "bg-white",
       buttonText: "text-black",
-      buttonHover: "hover:bg-zinc-200",
       closeButton: "text-zinc-500",
       closeButtonHover: "hover:text-zinc-300 hover:bg-white/10",
       dismissButtonHover: "hover:text-zinc-300 hover:bg-white/10",
@@ -120,9 +130,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-zinc-200",
       textPrimary: "text-zinc-900",
       textSecondary: "text-zinc-500",
-      buttonBg: "bg-zinc-900",
       buttonText: "text-white",
-      buttonHover: "hover:bg-zinc-800",
       closeButton: "text-zinc-400",
       closeButtonHover: "hover:text-zinc-900 hover:bg-zinc-100",
       dismissButtonHover: "hover:text-zinc-900 hover:bg-zinc-100",
@@ -135,9 +143,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-zinc-700",
       textPrimary: "text-zinc-100",
       textSecondary: "text-zinc-400",
-      buttonBg: "bg-white",
       buttonText: "text-zinc-900",
-      buttonHover: "hover:bg-zinc-200",
       closeButton: "text-zinc-500",
       closeButtonHover: "hover:text-zinc-300 hover:bg-zinc-800",
       dismissButtonHover: "hover:text-zinc-300 hover:bg-zinc-800",
@@ -153,9 +159,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-slate-100",
       textPrimary: "text-slate-700",
       textSecondary: "text-slate-500",
-      buttonBg: "bg-white shadow-sm border border-slate-200",
       buttonText: "text-slate-700",
-      buttonHover: "hover:bg-slate-100",
       closeButton: "text-slate-400",
       closeButtonHover: "hover:text-slate-700 hover:bg-slate-200/50",
       dismissButtonHover: "hover:text-slate-700 hover:bg-slate-200/50",
@@ -168,9 +172,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-slate-700/50",
       textPrimary: "text-slate-200",
       textSecondary: "text-slate-400",
-      buttonBg: "bg-slate-700 shadow-sm border border-slate-600",
       buttonText: "text-slate-200",
-      buttonHover: "hover:bg-slate-600",
       closeButton: "text-slate-400",
       closeButtonHover: "hover:text-slate-200 hover:bg-slate-600/50",
       dismissButtonHover: "hover:text-slate-200 hover:bg-slate-600/50",
@@ -186,9 +188,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-2 border-black",
       textPrimary: "text-black",
       textSecondary: "text-zinc-700",
-      buttonBg: "bg-black",
       buttonText: "text-white",
-      buttonHover: "hover:bg-zinc-800",
       closeButton: "text-zinc-400",
       closeButtonHover: "hover:text-black hover:bg-zinc-100",
       dismissButtonHover: "hover:text-black hover:bg-zinc-100",
@@ -201,9 +201,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-2 border-white",
       textPrimary: "text-white",
       textSecondary: "text-zinc-300",
-      buttonBg: "bg-white",
       buttonText: "text-black",
-      buttonHover: "hover:bg-zinc-200",
       closeButton: "text-zinc-500",
       closeButtonHover: "hover:text-white hover:bg-zinc-800",
       dismissButtonHover: "hover:text-white hover:bg-zinc-800",
@@ -219,9 +217,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-stone-200",
       textPrimary: "text-stone-800",
       textSecondary: "text-stone-500",
-      buttonBg: "bg-stone-200",
       buttonText: "text-stone-800",
-      buttonHover: "hover:bg-stone-300",
       closeButton: "text-stone-400",
       closeButtonHover: "hover:text-stone-800 hover:bg-stone-200/50",
       dismissButtonHover: "hover:text-stone-800 hover:bg-stone-200/50",
@@ -234,9 +230,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-stone-700",
       textPrimary: "text-stone-200",
       textSecondary: "text-stone-400",
-      buttonBg: "bg-stone-800",
       buttonText: "text-stone-200",
-      buttonHover: "hover:bg-stone-700",
       closeButton: "text-stone-500",
       closeButtonHover: "hover:text-stone-200 hover:bg-stone-800",
       dismissButtonHover: "hover:text-stone-200 hover:bg-stone-800",
@@ -252,9 +246,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-sky-200",
       textPrimary: "text-sky-900",
       textSecondary: "text-sky-700",
-      buttonBg: "bg-sky-200",
       buttonText: "text-sky-900",
-      buttonHover: "hover:bg-sky-300",
       closeButton: "text-sky-400",
       closeButtonHover: "hover:text-sky-900 hover:bg-sky-200/50",
       dismissButtonHover: "hover:text-sky-900 hover:bg-sky-200/50",
@@ -267,9 +259,7 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
       border: "border-sky-900/50",
       textPrimary: "text-sky-100",
       textSecondary: "text-sky-400",
-      buttonBg: "bg-sky-900/50",
       buttonText: "text-sky-100",
-      buttonHover: "hover:bg-sky-800/50",
       closeButton: "text-sky-600",
       closeButtonHover: "hover:text-sky-200 hover:bg-sky-900/50",
       dismissButtonHover: "hover:text-sky-200 hover:bg-sky-900/50",
@@ -278,38 +268,14 @@ export const themes: Record<string, { name: string; light: ToastTheme; dark: Toa
     },
   },
   macos: {
-    name: "macOS Glass",
-    light: {
-      name: "macOS Glass",
-      background: "bg-white/60  saturate-[1.5]",
-      border: "border-white/40",
-      textPrimary: "text-black/90",
-      textSecondary: "text-black/60",
-      buttonBg: "bg-white/50  border border-white/40 shadow-sm",
-      buttonText: "text-black/80",
-      buttonHover: "hover:bg-white/80",
-      closeButton: "text-black/30",
-      closeButtonHover: "hover:text-black/70 hover:bg-black/5",
-      dismissButtonHover: "hover:text-black/70 hover:bg-black/5",
-      shadow: "shadow-[0_8px_32px_rgba(0,0,0,0.08),inset_0_1px_0_rgba(255,255,255,0.6)]",
-      spinner: "text-black/50",
-      borderRadius: "rounded-[20px]",
-    },
+    name: glassToastTheme.name,
+    light: glassToastTheme,
     dark: {
-      name: "macOS Glass",
-      background: "bg-black/40  saturate-[1.5]",
-      border: "border-white/10",
-      textPrimary: "text-white/90",
-      textSecondary: "text-white/60",
-      buttonBg: "bg-black/50  border border-white/10 shadow-sm",
-      buttonText: "text-white/80",
-      buttonHover: "hover:bg-white/10",
-      closeButton: "text-white/30",
+      ...glassToastTheme,
+      background: "toast-glass toast-glass-dark",
       closeButtonHover: "hover:text-white/70 hover:bg-white/10",
       dismissButtonHover: "hover:text-white/70 hover:bg-white/10",
-      shadow: "shadow-[0_8px_32px_rgba(0,0,0,0.2),inset_0_1px_0_rgba(255,255,255,0.1)]",
       spinner: "text-white/50",
-      borderRadius: "rounded-[20px]",
     },
   },
 }
@@ -603,6 +569,7 @@ export interface ToastProps {
   index: number
   onRemove: (id: string) => void
   isHovered: boolean
+  stackFront?: boolean
   position: ToastPosition
   hoverOffset: number
   onHeightChange: (id: string, height: number) => void
@@ -615,6 +582,7 @@ export const Toast = React.memo(({
   index,
   onRemove,
   isHovered,
+  stackFront,
   position,
   hoverOffset,
   onHeightChange,
@@ -659,19 +627,15 @@ export const Toast = React.memo(({
   const animateAnimation = useMemo(() => animation.animate(ctx), [animation, ctx])
   const exitAnimation = useMemo(() => animation.exit(ctx), [animation, ctx])
 
-  const styleObj = useMemo(() => ({
-    zIndex: toast.zIndex,
-    willChange: "transform, opacity, filter",
-  }), [toast.zIndex])
-
   return (
     <motion.div
       ref={ref}
+      data-stack-front={stackFront ? "" : undefined}
       initial={initialAnimation}
       animate={animateAnimation}
       exit={exitAnimation}
       transition={animation.transition}
-      style={styleObj}
+      style={{ zIndex: toast.zIndex }}
       className={`absolute ${isBottom ? "bottom-0" : "top-0"} w-full ${theme.borderRadius || "rounded-xl"} ${theme.background} border ${theme.border} p-4 flex flex-col group pointer-events-auto ${theme.shadow}`}
     >
       <div className="flex items-start">
@@ -707,8 +671,10 @@ export const Toast = React.memo(({
             </div>
             {!toast.action && resolvedActions.length === 0 && (
               <button
+                type="button"
+                aria-label="关闭提示"
                 onClick={() => onRemove(toast.id)}
-                className={`w-6 h-6 rounded-full flex items-center justify-center ${theme.closeButton} ${theme.closeButtonHover} opacity-0 group-hover:opacity-100 transition-all duration-200 focus:outline-none -mt-1 -mr-1 shrink-0 ml-2`}
+                className={`w-6 h-6 rounded-full flex items-center justify-center ${theme.closeButton} ${theme.closeButtonHover} opacity-0 group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2 transition-[opacity,background-color] duration-200 -mt-1 -mr-1 shrink-0 ml-2`}
               >
                 <X size={14} strokeWidth={2.5} />
               </button>
@@ -723,11 +689,12 @@ export const Toast = React.memo(({
           {resolvedActions.length > 0 && (
             <div className="w-full flex justify-end gap-2 mt-1 flex-wrap">
               <button
+                type="button"
                 onClick={(event) => {
                   event.stopPropagation()
                   onRemove(toast.id)
                 }}
-                className={`px-3 py-1.5 bg-transparent ${theme.dismissButtonHover} ${theme.textSecondary} text-[12px] font-medium rounded-full transition-all active:scale-95`}
+                className={`px-3 py-1.5 bg-transparent ${theme.dismissButtonHover} ${theme.textSecondary} text-[12px] font-medium rounded-full transition-[background-color,scale] active:scale-95`}
               >
                 关闭
               </button>
@@ -820,7 +787,6 @@ export const Toaster: React.FC<ToasterProps> = ({
   const currentTheme = typeof theme === "string"
     ? themes[theme]?.[darkMode ? "dark" : "light"] || themes.default[darkMode ? "dark" : "light"]
     : theme
-
   const removeToast = useCallback((id: string) => {
     toastStore.removeToast(id)
     setHeights((prev) => {
@@ -881,6 +847,7 @@ export const Toaster: React.FC<ToasterProps> = ({
               index={index}
               onRemove={removeToast}
               isHovered={isHovered}
+              stackFront={index === 0 && items.length > 1 && !isHovered}
               position={position}
               hoverOffset={offsets[index]}
               onHeightChange={handleHeightChange}

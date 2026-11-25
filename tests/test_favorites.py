@@ -4,6 +4,7 @@ import io
 import json
 import sqlite3
 import shutil
+import struct
 import tempfile
 import unittest
 import wave
@@ -16,6 +17,7 @@ from core.data import Archive
 from core.favorites import FavoriteCatalog,FavoriteResources,export_favorites,parse_favorite
 from core.favorite_articles import ContentReader,fetch_article
 from core.service import Service
+from tests.test_audio_and_connection import silk_fixture
 from tests.test_resources import media_fixture,PNG,ASSETS
 
 
@@ -82,6 +84,8 @@ class FavoriteTests(unittest.TestCase):
         self.assertEqual(result['count'],95);self.assertEqual(len(list((out/'Markdown').glob('*.md'))),95)
 
     def test_export_verifies_opaque_cache_hash_and_exports_image_voice_note_and_record_without_secrets(self):
+        cache=Path(self.library['account_dir'])/'business/favorite/data/ab'
+        (cache/('f'*32)).write_bytes(bytes(value ^ 0x63 for value in PNG))
         out,result=self.export(ids=['2','4','5','7'])
         data=json.loads((out/'data.json').read_text('utf-8'));items={v['id']:v for v in data['items']}
         image=items['2']['blocks'][0]['resources'][0]
@@ -93,6 +97,59 @@ class FavoriteTests(unittest.TestCase):
         serialized=(out/'data.json').read_text('utf-8')+(out/'index.html').read_text('utf-8')+md
         self.assertNotIn('DO-NOT-EXPORT-KEY',serialized);self.assertNotIn('cdn_datakey',serialized)
         self.assertEqual(result['count'],4)
+
+    def test_legacy_voice_tries_both_snapshots_after_a_damaged_favorite_cache(self):
+        damaged = b'\x02#!SILK_V3\xff\x7f'
+        digest = hashlib.md5(damaged).hexdigest()
+        cache = Path(self.library['account_dir']) / 'business/favorite/data/ab'
+        (cache / ('d' * 32)).write_bytes(damaged)
+        root = Path(self.library['root'])
+        assets = self.root / 'refreshed-assets'
+        (assets / 'message').mkdir(parents=True)
+        self.library['assets_root'] = str(assets)
+        shard = 'message/media_0.db'
+        shutil.copy2(root / shard, assets / shard)
+        with closing(sqlite3.connect(assets / shard)) as con, con:
+            con.execute('UPDATE VoiceInfo SET voice_data=? WHERE svr_id=123', (damaged,))
+        voice = silk_fixture(200, sample_rate=16000)
+        packet_end = 12 + struct.unpack_from('<h', voice, 10)[0]
+        with_loss = voice[:packet_end] + b'\0\0' + voice[packet_end:] + b'\xff\xff'
+        with closing(sqlite3.connect(root / shard)) as con, con:
+            con.execute('UPDATE VoiceInfo SET voice_data=? WHERE svr_id=123', (with_loss,))
+            con.execute('INSERT INTO VoiceInfo VALUES (-19, 1, ?)', (silk_fixture(120)[1:] + b'\xff\xff',))
+        standalone = ('<favitem><source><msgid>123</msgid></source><datalist><dataitem datatype="3">'
+                      f'<fullmd5>{digest}</fullmd5><datafmt>silk</datafmt></dataitem></datalist></favitem>')
+        nested = ('<recordinfo><datalist><dataitem datatype="4"><datafmt>silk</datafmt></dataitem>'
+                  f'<dataitem datatype="4"><fromnewmsgid>{(1 << 64) - 19}</fromnewmsgid>'
+                  '<datafmt>silk</datafmt></dataitem></datalist></recordinfo>')
+        forwarded = ('<favitem><source><msgid>123</msgid></source><datalist>'
+                     f'<dataitem datatype="17"><recorditem>{escape(nested)}</recorditem></dataitem></datalist></favitem>')
+        with closing(sqlite3.connect(root / 'favorite/favorite.db')) as con, con:
+            con.executemany('UPDATE fav_db_item SET content=? WHERE local_id=?', [(standalone, 5), (forwarded, 4)])
+
+        out, result = self.export(ids=['4', '5'])
+        items = {item['id']: item['blocks'][0] for item in json.loads((out / 'data.json').read_text('utf-8'))['items']}
+        without_id, nested_voice = items['4']['children']
+        self.assertEqual(without_id['resources'], [])
+        self.assertIn('本机未找到', without_id['notice'])
+        for block, frames in ((items['5'], 5280), (nested_voice, 2880)):
+            resource, = block['resources']
+            self.assertEqual((resource['kind'], resource['status']), ('audio', 'available'))
+            with wave.open(str(out / resource['path']), 'rb') as audio:
+                self.assertEqual((audio.getframerate(), audio.getnframes()), (24000, frames))
+        self.assertEqual(result['resource_summary']['unsupported'], 0)
+
+    def test_unplayable_favorite_voice_keeps_original_bytes(self):
+        original = b'\x02#!SILK_V3\xff\x7f'
+        with closing(sqlite3.connect(Path(self.library['root']) / 'message/media_0.db')) as con, con:
+            con.execute('UPDATE VoiceInfo SET voice_data=? WHERE svr_id=123', (original,))
+        out, result = self.export(ids=['5'])
+        block = json.loads((out / 'data.json').read_text('utf-8'))['items'][0]['blocks'][0]
+        resource, = block['resources']
+        self.assertEqual((resource['kind'], resource['status']), ('original', 'unsupported'))
+        self.assertEqual((out / resource['path']).read_bytes(), original)
+        self.assertEqual(result['resource_summary']['unsupported'], 1)
+        self.assertEqual(result['resource_summary']['missing'], 0)
 
     def test_favorite_index_only_stages_selected_files_and_rechecks_their_content(self):
         from core.resources import ResourceStore

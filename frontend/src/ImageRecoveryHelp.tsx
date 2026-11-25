@@ -7,7 +7,7 @@ export function ImageRecoveryHelp({open,busy,onOpenChange,onStart}:{open:boolean
   const [skipHelp,setSkipHelp]=useState(false)
   useEffect(()=>{if(open)setSkipHelp(false)},[open])
   return <Dialog open={open} onOpenChange={next=>{if(!busy)onOpenChange(next)}}>
-    <DialogContent className="w-[calc(100%_-_2rem)] max-w-lg max-h-[calc(100vh_-_2rem)] overflow-y-auto p-6">
+    <DialogContent frosted className="w-[calc(100%_-_2rem)] max-w-lg max-h-[calc(100vh_-_2rem)] overflow-y-auto p-6">
       <header className="flex items-start gap-3 pr-6">
         <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-primary/10 text-primary"><KeyRound className="h-5 w-5"/></span>
         <div><DialogTitle>恢复图片前，先在微信做好准备</DialogTitle><DialogDescription>保持同一个微信账号登录，按下面两步操作。</DialogDescription></div>

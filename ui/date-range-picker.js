@@ -10,7 +10,7 @@
     *{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--accent) 45%,var(--bg)) transparent}
     ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--accent) 45%,var(--bg));border-radius:20px}
     button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}button:disabled{opacity:.4;cursor:default}button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}[hidden]{display:none!important}
-    .trigger{display:inline-flex;gap:9px;align-items:center;width:fit-content;max-width:min(100%,360px);min-height:36px;padding:8px 15px;border-radius:20px;background:color-mix(in srgb,var(--fg) 5%,transparent);text-align:left;font-size:13px;line-height:1.5}.caption{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .trigger{display:inline-flex;gap:9px;align-items:center;width:fit-content;max-width:min(100%,360px);min-height:36px;padding:8px 15px;border-radius:20px;background:color-mix(in srgb,var(--fg) 5%,transparent);text-align:left;font-size:13px;line-height:1.5}.trigger-chevron{display:none}.caption{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     dialog{position:fixed;inset:auto;margin:0;padding:0;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto;border:1px solid var(--line);border-radius:18px;background:var(--bg);color:var(--fg);box-shadow:0 18px 64px #0002;font:inherit}
     dialog::backdrop{background:var(--moect-backdrop,rgba(0,0,0,.25))}.panel{position:relative;display:flex;width:540px;max-width:100%;min-height:360px}
     .calendar{padding:18px;width:300px;flex-shrink:0}.month{display:grid;grid-template-columns:28px minmax(0,1fr) 28px;align-items:center;margin-bottom:16px;height:34px}.month-center{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0}.month button{display:flex;align-items:center;justify-content:center;gap:5px;border-radius:10px;height:32px;font-size:14px;font-weight:500}.month .year,.month .mon{padding:0 10px;background:var(--soft);white-space:nowrap}.month .prev,.month .next{padding:0;font-size:23px;color:var(--dim)}.month button:hover{background:color-mix(in srgb,var(--accent) 16%,var(--bg));color:var(--accent)}
@@ -23,23 +23,34 @@
   `;
 
   class DateRange extends HTMLElement {
-    static get observedAttributes() { return ['start', 'end', 'empty-label', 'disabled']; }
+    static get observedAttributes() { return ['start', 'end', 'empty-label', 'trigger-label', 'pressed', 'disabled']; }
     constructor() { super(); this.attachShadow({mode: 'open'}); this.month = new Date(); this.s = ''; this.e = ''; this.stage = 0; this.menu = null; }
     connectedCallback() { this.render(); }
-    attributeChangedCallback() { if (this.isConnected) this.render(); }
+    attributeChangedCallback() { if (this.isConnected) this.updateTrigger(); }
     q(selector) { return this.shadowRoot.querySelector(selector); }
     modal(open) { this.dispatchEvent(new CustomEvent('moect-calendar-modal', {detail: {open}, bubbles: true, composed: true})); }
+    updateTrigger() {
+      const trigger = this.q('.trigger');
+      if (!trigger) return;
+      const s = this.getAttribute('start') || '', e = this.getAttribute('end') || '';
+      const label = this.getAttribute('trigger-label');
+      const range = valid(s) ? `${s.replace('T',' ')}${valid(e) ? ' 至 ' + e.replace('T',' ') : ''}` : '';
+      this.q('.caption').textContent = label || range || this.getAttribute('empty-label') || '选择时间范围（留空显示全部）';
+      trigger.title = range || this.q('.caption').textContent;
+      trigger.disabled = this.hasAttribute('disabled');
+      if (this.hasAttribute('pressed')) trigger.setAttribute('aria-pressed', this.getAttribute('pressed'));
+      else trigger.removeAttribute('aria-pressed');
+    }
     render() {
       if (this.q('dialog[open]')) return;
-      this.shadowRoot.innerHTML = `<style>${css}</style><button class="trigger" type="button" aria-haspopup="dialog"><span aria-hidden="true">▦</span><span class="caption"></span></button><dialog aria-label="选择时间范围（北京时间）"><div class="panel"><div class="calendar"><div class="month"><button class="prev" aria-label="上个月">‹</button><div class="month-center"><button class="year" aria-label="选择年份" aria-haspopup="dialog"><span></span>${chevron}</button><button class="mon" aria-label="选择月份" aria-haspopup="dialog"><span></span>${chevron}</button></div><button class="next" aria-label="下个月">›</button></div><div class="week">${['日','一','二','三','四','五','六'].map(v => `<span>${v}</span>`).join('')}</div><div class="days"></div></div><aside><div class="endpoints"></div><div class="error" role="status"></div><div class="actions"><button class="today-button quiet">回到今天</button><button class="clear quiet">清除</button><button class="apply">应用并确定</button><button class="cancel">取消</button></div></aside><div class="flyout" hidden role="dialog" aria-modal="false"></div></div></dialog>`;
+      this.shadowRoot.innerHTML = `<style>${css}</style><button class="trigger" part="trigger" type="button" aria-haspopup="dialog" aria-expanded="false"><span part="calendar-icon" aria-hidden="true">▦</span><span class="caption"></span><span class="trigger-chevron" part="trigger-chevron" aria-hidden="true">${chevron}</span></button><dialog part="panel" aria-label="选择时间范围（北京时间）"><div class="panel"><div class="calendar"><div class="month"><button class="prev" aria-label="上个月">‹</button><div class="month-center"><button class="year" aria-label="选择年份" aria-haspopup="dialog"><span></span>${chevron}</button><button class="mon" aria-label="选择月份" aria-haspopup="dialog"><span></span>${chevron}</button></div><button class="next" aria-label="下个月">›</button></div><div class="week">${['日','一','二','三','四','五','六'].map(v => `<span>${v}</span>`).join('')}</div><div class="days"></div></div><aside><div class="endpoints"></div><div class="error" role="status"></div><div class="actions"><button class="today-button quiet">回到今天</button><button class="clear quiet">清除</button><button class="apply">应用并确定</button><button class="cancel">取消</button></div></aside><div class="flyout" hidden role="dialog" aria-modal="false"></div></div></dialog>`;
       for (const button of this.shadowRoot.querySelectorAll('button')) button.type = 'button';
-      const s = this.getAttribute('start') || '', e = this.getAttribute('end') || '', dialog = this.q('dialog'), trigger = this.q('.trigger');
-      this.q('.caption').textContent = valid(s) ? `${s.replace('T',' ')}${valid(e) ? ' 至 ' + e.replace('T',' ') : ''}` : (this.getAttribute('empty-label') || '选择时间范围（留空显示全部）');
-      trigger.title = this.q('.caption').textContent;
-      trigger.disabled = this.hasAttribute('disabled');
+      const dialog = this.q('dialog'), trigger = this.q('.trigger');
+      this.updateTrigger();
       trigger.onclick = () => {
+        const s = this.getAttribute('start') || '', e = this.getAttribute('end') || '';
         this.s = s; this.e = e; this.stage = 0; this.month = valid(s) ? new Date(s) : new Date(); this.fill();
-        dialog.showModal(); this.modal(true);
+        dialog.showModal(); trigger.setAttribute('aria-expanded', 'true'); this.modal(true);
         const r = trigger.getBoundingClientRect();
         dialog.style.left = Math.max(12, Math.min(r.left, innerWidth - dialog.offsetWidth - 12)) + 'px';
         dialog.style.top = Math.max(12, Math.min(r.bottom + 8, innerHeight - dialog.offsetHeight - 12)) + 'px';
@@ -52,9 +63,14 @@
       this.q('.cancel').onclick = () => dialog.close();
       this.q('.clear').onclick = () => this.commit('', '');
       this.q('.apply').onclick = () => { if (this.valid()) this.commit(this.s, this.e); };
-      dialog.addEventListener('close', () => { this.closeMenu(); this.modal(false); });
+      dialog.addEventListener('close', () => { trigger.setAttribute('aria-expanded', 'false'); this.closeMenu(); this.modal(false); });
       dialog.addEventListener('cancel', event => { if (this.menu) { event.preventDefault(); this.closeMenu(true); } });
-      dialog.addEventListener('keydown', event => { if (event.key === 'Escape' && this.menu) { event.preventDefault(); event.stopPropagation(); this.closeMenu(true); } });
+      dialog.addEventListener('keydown', event => {
+        if (event.key !== 'Escape') return;
+        event.preventDefault(); event.stopPropagation();
+        if (this.menu) this.closeMenu(true);
+        else dialog.close();
+      });
       dialog.addEventListener('click', event => {
         const r = dialog.getBoundingClientRect();
         if (event.target === dialog && (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom)) dialog.close();

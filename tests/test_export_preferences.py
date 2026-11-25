@@ -143,6 +143,18 @@ class ExportPreferenceTests(unittest.TestCase):
         self.assertEqual(len(all_rows)-len(filtered),2)
         self.assertFalse(any(row['kind']=='system' for row in filtered))
 
+    def test_html_cannot_restore_an_excluded_system_quote_from_fallback_metadata(self):
+        message = next(self.archive.messages(SESSION))
+        quote = {'type':10002,'server_id':'6789012','sender':'通知','text':'合成系统引用内容'}
+        message.update(kind='quote', text='保留用户回复', _quote=dict(quote, content=quote['text']),
+                       extra={'reply':quote})
+        for include in (True, False):
+            with patch.object(self.archive,'messages',return_value=iter([message])):
+                result = self.export({'format':'html','quickExport':True,'includeSystemMessages':include}, str(include))
+            chunk = Path(result['path']).with_name('c000001.js').read_text(encoding='utf-8')
+            self.assertIn('保留用户回复', chunk)
+            self.assertEqual(quote['text'] in chunk, include)
+
     def test_bridge_options_reach_the_export_job(self):
         service=Service(ASSETS,self.root/'service-state');service.library=self.lib
         service.config['export_dir']=str(self.root/'service-out')

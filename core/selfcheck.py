@@ -39,13 +39,17 @@ def run(report):
                 result['checks']['aes_zip'] = b'Synthetic' in archive.read('聊天.html')
             path = root/'records.xlsx'
             count = write_excel(path, iter([{'time_str':'2026-11-06','text':'=1+1','server_id':'326543963595411110'}]),
-                                'Synthetic', lambda message: (message['text'], ''), lambda _: None, lambda: None)
+                                'Synthetic', lambda message: (message['text'], []), lambda _: None, lambda: None)
             result['checks']['excel'] = count == 1 and path.stat().st_size > 0
             samples = [int(7000 * math.sin(2 * math.pi * 440 * i/24000)) for i in range(480)]
             silk = pysilk.encode(struct.pack('<480h', *samples), sample_rate=24000)
             audio = MediaCodec(lambda: None).audio(silk, root/'voice.wav')
             with wave.open(str(audio), 'rb') as stream:
                 result['checks']['silk_wav'] = stream.getnframes() == 480
+            legacy = silk + b'\0\0\xff\xff'
+            audio = MediaCodec(lambda: None).audio(legacy, root/'legacy-voice.wav')
+            with wave.open(str(audio), 'rb') as stream:
+                result['checks']['silk_legacy_wav'] = stream.getnframes() == 960
             # Exercise the actual frozen favorite exporter and its new template;
             # importing successfully alone cannot catch omitted HTML assets.
             from .favorites import export_favorites

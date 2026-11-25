@@ -2,7 +2,7 @@
 (() => {
   function append(parent, value) {
     const text = String(value ?? ''), faces = window.MoectInlineFaces || {};
-    const pattern = /https?:\/\/[^\s<>"']+|\[[^\[\]\r\n]{1,32}\]/g;
+    const pattern = /https?:\/\/[^\s<>"'，。！？、；：“”【】（）]+|\[[^\[\]\r\n]{1,32}\]/gi;
     let offset = 0;
     for (const match of text.matchAll(pattern)) {
       parent.append(document.createTextNode(text.slice(offset, match.index)));

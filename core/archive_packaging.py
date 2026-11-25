@@ -109,29 +109,30 @@ def package_folder(folder, destination, password, cancel, status, progress=lambd
             progress(percent / 100)
     if password:
         import pyzipper
-        archive = pyzipper.AESZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED,
-                                     compresslevel=6, encryption=pyzipper.WZ_AES, allowZip64=True)
-        archive.setpassword(password)
-        archive.setencryption(pyzipper.WZ_AES, nbits=256)
-        entry_type = archive.zipinfo_cls
+        reader = pyzipper.AESZipFile
     else:
-        archive = zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True)
-        entry_type = zipfile.ZipInfo
-    already_compressed = {'.jpg','.jpeg','.png','.gif','.webp','.mp4','.mov','.webm','.mkv','.mp3','.m4a','.flac'}
+        reader = zipfile.ZipFile
+    already_compressed = {'.jpg','.jpeg','.png','.gif','.webp','.mp4','.mov','.webm','.mkv','.mp3','.m4a','.flac',
+                          '.zip','.rar','.7z','.xlsx','.docx','.pptx'}
+    timestamp = localtime()[:6]
+    output = destination.open('xb')
     try:
-        with archive:
+        with output, reader(output, 'w', allowZip64=True) as archive:
+            entry_type = zipfile.ZipInfo
+            if password:
+                archive.setpassword(password)
+                archive.setencryption(pyzipper.WZ_AES, nbits=256)
+                entry_type = archive.zipinfo_cls
             for number, (path, size) in enumerate(sorted(files), 1):
                 cancel()
                 status('正在压缩 %d / %d 个文件…' % (number, len(files)))
                 member = path.relative_to(folder).as_posix()
                 if root_name:
                     member = root_name + '/' + member
-                if path.suffix.lower() in already_compressed:
-                    entry = entry_type(member, date_time=localtime()[:6])
-                    entry.compress_type = zipfile.ZIP_STORED
-                    entry.file_size = size
-                    member = entry
-                with path.open('rb') as source, archive.open(member, 'w', force_zip64=True) as target:
+                entry = entry_type(member, date_time=timestamp)
+                entry.compress_type = zipfile.ZIP_STORED if path.suffix.lower() in already_compressed else zipfile.ZIP_DEFLATED
+                entry.file_size = size
+                with path.open('rb') as source, archive.open(entry, 'w') as target:
                     while True:
                         cancel()
                         block = source.read(1024 * 1024)
@@ -140,7 +141,6 @@ def package_folder(folder, destination, password, cancel, status, progress=lambd
                         target.write(block)
                         advance(len(block))
         status('正在校验压缩包完整性…')
-        reader = pyzipper.AESZipFile if password else zipfile.ZipFile
         with reader(destination) as verified:
             if password:
                 verified.setpassword(password)

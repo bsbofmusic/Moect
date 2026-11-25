@@ -1,6 +1,7 @@
 "use client"
 
 import { ChevronDown, Check } from "lucide-react"
+import { cn } from "@/lib/utils"
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -15,14 +16,20 @@ export function PillDropdown<T extends string>({
   options,
   leadingAction,
   disabled,
+  ariaLabel,
+  menuClassName,
   align = "end",
+  frosted = false,
 }: {
   value: T
   onChange: (v: T) => void
   options: { value: T; label: string }[]
   leadingAction?: { label: string; disabled?: boolean; onSelect: () => void }
   disabled?: boolean
+  ariaLabel?: string
+  menuClassName?: string
   align?: "start" | "center" | "end"
+  frosted?: boolean
 }) {
   const current = options.find((o) => o.value === value)
   return (
@@ -31,13 +38,18 @@ export function PillDropdown<T extends string>({
         <button
           type="button"
           disabled={disabled}
-          className="inline-flex items-center gap-1.5 h-8 pl-3 pr-2.5 text-[13px] font-medium rounded-full bg-white dark:bg-neutral-900 border border-black/[0.03] dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.02)] text-neutral-700 dark:text-neutral-200 outline-none cursor-pointer hover:border-black/[0.08] hover:bg-neutral-50 dark:hover:bg-white/5 transition-all disabled:opacity-50 disabled:pointer-events-none"
+          aria-label={ariaLabel && current ? `${ariaLabel}，${current.label}` : ariaLabel}
+          className="pill-trigger"
         >
-          <span className="whitespace-nowrap">{current?.label}</span>
-          <ChevronDown className="w-3.5 h-3.5 text-neutral-400" />
+          <span className="whitespace-nowrap">{current?.label ?? ariaLabel}</span>
+          <ChevronDown className="pill-trigger-chevron w-3.5 h-3.5" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align={align} className="min-w-[140px]">
+      <DropdownMenuContent
+        align={align}
+        frosted={frosted}
+        className={cn("min-w-[140px] max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-x-hidden overflow-y-auto", menuClassName)}
+      >
         {leadingAction && <>
           <DropdownMenuItem disabled={leadingAction.disabled} onSelect={leadingAction.onSelect}>
             {leadingAction.label}
@@ -47,7 +59,7 @@ export function PillDropdown<T extends string>({
         {options.map((o) => (
           <DropdownMenuItem
             key={o.value}
-            onClick={() => onChange(o.value)}
+            onSelect={() => onChange(o.value)}
             className="flex items-center justify-between"
           >
             <span>{o.label}</span>

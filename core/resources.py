@@ -4,7 +4,6 @@ The resource-index and structured-reply stages follow QCE's export pipeline;
 WeChat ChatName2Id/MessageResourceInfo and DAT decryption remain WeChat-specific.
 """
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -21,11 +20,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 from .avatars import AvatarStore,image_type
 from .media_codec import ImageKeys,MediaCodec,media_type,encrypted_media_variants,is_flac_message
-from wx4.reader import reference_text,_xml
+from wx4.reader import reference_text,_xml,normalize_local_type
 from wx4.game_emojis import describe_game,from_hash
 from .game_emojis import game_image
 from wx4.forward import build_forward
 from .export_options import RESOURCE_TYPES,export_preferences,is_system_message
+from .streaming import json_line
 
 HASH=re.compile(r'(?i)(?<![a-f0-9])[a-f0-9]{32}(?![a-f0-9])')
 FILE_INDEX = """
@@ -124,7 +124,7 @@ class BatchMediaIndex:
 
 
 class ResourceStore:
-    def __init__(self,data,session,destination,cancel=lambda:None,status=None,options=None,preview=False, *, remote_media=True, batch_media=None):
+    def __init__(self,data,session,destination,cancel=lambda:None,status=None,options=None,preview=False, *, remote_media=True, batch_media=None, report=True):
         self.data=data;self.session=session;self.out=Path(destination);self.cancel=cancel
         self.preview=preview;self.retry=False;self.sticker_decoder=None
         self.preview_flac = False
@@ -152,7 +152,7 @@ class ResourceStore:
             self.stats={'available':0,'missing':0,'encrypted':0,'unsupported':0,'corrupt':0,'skipped':0}
             self.failed_downloads=set()
             self.download_outcomes={};self.prefer_direct=False
-            self.report=handles.enter_context(open(self.out/'resource-report.jsonl','w',encoding='utf-8'))
+            self.report=handles.enter_context(open(self.out/'resource-report.jsonl','w',encoding='utf-8')) if report else None
             self._handles = handles.pop_all()
 
     def close(self):
@@ -672,7 +672,13 @@ class ResourceStore:
                 msg['resource_notice']=('已显示本机缩略图，原图尚未缓存或未能取得。' if status=='missing'
                     else '已提供缩略图；'+msg['resource_notice'])
         msg['resources']=resources
-        if kind=='quote' and depth<6:msg['quote']=self._quote(msg,depth)
+        if kind=='quote':
+            if depth<6:msg['quote']=self._quote(msg,depth)
+            if not self.preferences['include_system_messages']:
+                fallback=msg['extra'].get('reply') or {}
+                if (msg.get('_quote') and depth<6 and msg['quote'] is None
+                        or is_system_message({'type':normalize_local_type(fallback.get('type'))})):
+                    msg['extra'].pop('reply',None)
         if kind=='chatrecord' and depth<6:
             record=dict(msg.get('forward') or build_forward(self.data,msg))
             if not skip_all:self._index_forward_media()
@@ -687,8 +693,8 @@ class ResourceStore:
             record['count']=len(record['messages'])
             msg['forward']=record
         if resources or msg.get('resource_status') or network_diagnostics:
-            self.report.write(json.dumps({'message_id':str(msg.get('server_id') or ''),'kind':kind,
+            self.report.write(json_line({'message_id':str(msg.get('server_id') or ''),'kind':kind,
                 'status':msg.get('resource_status','available'),'notice':msg.get('resource_notice',''),
                 'resources':resources,'image_diagnostics':image_diagnostics,'audio_diagnostics':audio_diagnostics,
-                'network_diagnostics':network_diagnostics},ensure_ascii=False)+'\n')
+                'network_diagnostics':network_diagnostics}))
         return msg

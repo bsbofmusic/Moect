@@ -7,11 +7,13 @@ export interface DateRangePickerProps {
   onChange?:(start:string,end:string)=>void
   className?:string
   emptyLabel?:string
+  triggerLabel?:string
+  pressed?:boolean
   disabled?:boolean
 }
 
 /** Identical calendar and clock controls in the desktop and offline HTML. */
-export function DateRangePicker({startTime='',endTime='',onChange,className,emptyLabel,disabled}:DateRangePickerProps){
+export function DateRangePicker({startTime='',endTime='',onChange,className,emptyLabel,triggerLabel,pressed,disabled}:DateRangePickerProps){
   const host=useRef<HTMLDivElement>(null),callback=useRef(onChange)
   callback.current=onChange
   useEffect(()=>{
@@ -24,7 +26,11 @@ export function DateRangePicker({startTime='',endTime='',onChange,className,empt
     const element=host.current?.firstElementChild
     element?.setAttribute('start',startTime);element?.setAttribute('end',endTime)
     element?.setAttribute('empty-label',emptyLabel||'选择时间范围')
+    if(triggerLabel) element?.setAttribute('trigger-label',triggerLabel)
+    else element?.removeAttribute('trigger-label')
+    if(pressed===undefined) element?.removeAttribute('pressed')
+    else element?.setAttribute('pressed',String(pressed))
     element?.toggleAttribute('disabled',!!disabled)
-  },[startTime,endTime,emptyLabel,disabled])
+  },[startTime,endTime,emptyLabel,triggerLabel,pressed,disabled])
   return <div ref={host} className={className}/>
 }

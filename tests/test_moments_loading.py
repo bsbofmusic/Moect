@@ -86,6 +86,29 @@ class SocialExportTests(unittest.TestCase):
             self.assertEqual((folder/first['resources'][0]['path']).read_bytes(),PNG)
             self.assertEqual(store.stats['available'],2)
 
+    def test_parallel_moments_publish_shared_media_in_the_export(self):
+        database=Path(self.library['root'])/'sns/sns.db'
+        with closing(sqlite3.connect(database)) as con,con:
+            content=con.execute('SELECT content FROM SnsTimeLine WHERE tid=100').fetchone()[0]
+            duplicate=content.replace('<id>100</id>','<id>101</id>',1)
+            con.execute('DELETE FROM SnsTimeLine')
+            con.executemany('INSERT INTO SnsTimeLine VALUES (?,?,?,NULL)',[(100,USER,content),(101,USER,duplicate)])
+        folder=self.root/'shared-export';folder.mkdir()
+        progress=[]
+        with patch('core.account_exporting.export_worker_limit',return_value=2), \
+             patch.object(MomentResources,'_convert',autospec=True,side_effect=MomentResources._convert) as convert:
+            result=export_moments(self.archive,self.library,{},folder,ASSETS,
+                                  lambda *value:progress.append(value),lambda:None,lambda _:None)
+        self.assertEqual(convert.call_count,1)
+        self.assertEqual(progress,[(0,2),(1,2),(2,2)])
+        self.assertEqual(result['resource_summary']['available'],2)
+        posts=json.loads((folder/'data.json').read_text(encoding='utf-8'))['items']
+        self.assertEqual([post['id'] for post in posts],['101','100'])
+        first,second=[post['resources'][0]['path'] for post in posts]
+        self.assertEqual(first,second)
+        self.assertEqual((folder/first).read_bytes(),PNG)
+        self.assertFalse(list(folder.glob('.media-*')))
+
     def test_moments_preview_and_export_without_dates_are_local_and_do_not_enqueue_refresh(self):
         service=Service(ASSETS,self.root/'local-state');service.library=service.config['library']=self.library;service.config['export_dir']=str(self.root/'exports')
         try:
@@ -148,6 +171,32 @@ vm.runInNewContext(fs.readFileSync('ui/date-range-picker.js','utf8'),{HTMLElemen
 const p=new Picker();let closed=0;p.q=()=>({close:()=>closed++});p.s='2026-11-01T12:00';p.e='2026-11-01T12:01';assert.equal(p.valid(),true);assert.equal(p.events.length,0);p.e='2026-11-01T11:59';assert.equal(p.valid(),false);p.e='2026-11-01T12:01';p.commit(p.s,p.e);assert.equal(p.events.length,1);assert.equal(closed,1);assert.deepEqual(JSON.parse(JSON.stringify(p.events[0].detail)),{start:'2026-11-01T12:00',end:'2026-11-01T12:01'});'''
         result=subprocess.run(['node'],input=script,text=True,encoding='utf-8',capture_output=True)
         self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_asset_help_settings_are_independent_and_survive_restart(self):
+        root = self.root / 'asset-preferences'
+        root.mkdir()
+        (root / 'config.json').write_text('{"theme":"light"}', encoding='utf-8')
+        keys = ('favorites_help_hidden', 'moments_timeline_help_hidden')
+        service = Service(ASSETS, root)
+        try:
+            for key in keys:
+                with self.subTest(key=key):
+                    self.assertIs(service.state()[key], False)
+                    with self.assertRaises(ValueError):
+                        service.settings({key: 'true'})
+                    with patch.object(service, 'save', side_effect=OSError('write failed')):
+                        with self.assertRaises(OSError):
+                            service.settings({key: True})
+                    self.assertIs(service.state()[key], False)
+                    self.assertIs(service.settings({key: True})[key], True)
+        finally:
+            service.shutdown()
+        restarted = Service(ASSETS, root)
+        try:
+            for key in keys:
+                self.assertIs(restarted.state()[key], True)
+        finally:
+            restarted.shutdown()
 
 
 if __name__=='__main__':unittest.main()

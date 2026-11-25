@@ -1,4 +1,11 @@
 const MoectMedia = {
+  localPath(path) {
+    // Archive manifests store filenames, including literal percent signs.
+    if (typeof path !== "string" || /^[a-z][a-z0-9+.-]*:|[\\\x00-\x1f]/i.test(path)) return "";
+    const parts = path.split("/");
+    if (parts.some(part => !part || part === "." || part === "..")) return "";
+    return parts.map(encodeURIComponent).join("/");
+  },
   mount(root) {
     const dialog = document.createElement("dialog");
     dialog.className = "moect-image-viewer";
@@ -119,14 +126,11 @@ const MoectMedia = {
     });
     new ResizeObserver(fit).observe(frame);
     root.addEventListener("click", (event) => {
-      const target = event.target.closest("img");
-      if (!target || !target.closest("a") || !root.contains(target)) return;
-      const images = [
-        ...root.querySelectorAll(
-          "a > img.attachment, a.photo-link > img, .sticker a > img",
-        ),
-      ];
-      const selected = images.indexOf(target);
+      if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      const anchor = event.target.closest?.("a");
+      if (!anchor || !root.contains(anchor)) return;
+      const images = [...root.querySelectorAll("a > img.attachment, a.photo-link > img, .sticker a > img, a > img.comment-media")];
+      const selected = images.findIndex(item => item.parentElement === anchor);
       if (selected < 0) return;
       event.preventDefault();
       sources = images.map((item) => item.closest("a").href);

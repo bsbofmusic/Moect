@@ -4,7 +4,7 @@ ACCENTS = (
     ('blue','晴空蓝','#3565b5','#aac7ff'),
     ('cyan','青瓷青','#006a78','#80d5e4'),
     ('green','松叶绿','#386b45','#9fd6a8'),
-    ('orange','暖杏橙','#985018','#ffb781'),
+    ('orange','暖栗棕','#985018','#ffb781'),
     ('rose','蔷薇粉','#9c426b','#ffb0d1'),
     ('red','朱砂红','#ac3942','#ffb3b7'),
     ('slate','雾山灰','#52636c','#b6cbd7'),
@@ -77,3 +77,21 @@ def theme_archive(template,theme=None):
         variables=':root{color-scheme:'+theme['mode']+';'+''.join('--'+k+':'+v+';' for k,v in colors.items())+'--moect-backdrop:rgba(0,0,0,'+('.5' if theme['mode']=='dark' else '.25')+')}*{scrollbar-color:var(--primary) var(--background)}'
         return match.group(1)+variables+css+match.group(3)
     return re.sub(r'(<style\b[^>]*>)(.*?)(</style>)',style,template,flags=re.S|re.I)
+
+
+def archive_viewer_template(assets, filename, theme=None):
+    theme = archive_theme(theme)
+    template = theme_archive((assets / filename).read_text(encoding='utf-8'), theme)
+    template = template.replace('__ARCHIVE_MODE__', theme['mode'])
+    for marker, asset in (
+        ('__ARCHIVE_SHELL_CSS__', 'archive-shell.css'),
+        ('__ARCHIVE_SHELL__', 'archive-shell.js'),
+        ('__ARCHIVE_GLASS__', 'glass.css'),
+        ('__DATE_RANGE_PICKER__', 'date-range-picker.js'),
+        ('__ARCHIVE_PRINT__', 'archive-print.js'),
+        ('__ARCHIVE_MEDIA__', 'archive-media.js'),
+        ('__INLINE_FACES__', 'inline-faces.js'),
+    ):
+        if marker in template:
+            template = template.replace(marker, (assets / asset).read_text(encoding='utf-8'))
+    return template

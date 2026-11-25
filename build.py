@@ -40,6 +40,9 @@ subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--win
                '--add-data','ui-qce;ui-qce','--add-data','ui/viewer.html;ui',
                '--add-data','ui/collection.html;ui',
                '--add-data','ui/favorites.html;ui',
+               '--add-data','ui/archive-shell.css;ui',
+               '--add-data','ui/archive-shell.js;ui',
+               '--add-data','ui/glass.css;ui',
                '--add-data','ui/date-range-picker.js;ui',
                '--add-data','ui/archive-print.js;ui',
                '--add-data','ui/archive-media.js;ui',
@@ -59,6 +62,7 @@ subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--win
                '--collect-all','webview','--collect-all','pythonnet','--collect-all','clr_loader',
                '--collect-all','imageio_ffmpeg',
                '--collect-all','pysilk',
+               '--collect-all','pilk','--copy-metadata','pilk',
                '--collect-all','pyzipper','--collect-all','xlsxwriter',
                '--hidden-import','webview.platforms.edgechromium','--hidden-import','webview.platforms.winforms',
                'edge_app.py'],cwd=root,env=env,check=True)

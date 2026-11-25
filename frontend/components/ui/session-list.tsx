@@ -364,41 +364,21 @@ function SessionListComponent({
             >
               预览
             </button>
-            {isGroup && group ? (
-              <div className="flex items-center bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] rounded-full overflow-hidden hover:border-black/10 transition-all">
-                <button
-                  className="inline-flex items-center justify-center h-7 pl-3 pr-2 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 hover:text-neutral-900 dark:hover:text-white hover:bg-neutral-50 dark:hover:bg-white/5 transition-colors border-r border-neutral-200/80 dark:border-white/10"
-                  onClick={(e: React.MouseEvent) => {
-                    e.stopPropagation()
-                    onOpenTaskWizard?.({
-                      chatType: 2,
-                      peerUid: item.id,
-                      peerUin: item.id,
-                      sessionName: item.name,
-                    })
-                  }}
-                >
-                  导出
-                </button>
-              </div>
-            ) : (
-              <button
-                className="inline-flex items-center justify-center h-7 px-3 text-[12px] font-medium text-neutral-700 dark:text-neutral-200 bg-white dark:bg-neutral-900 border border-black/5 dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:border-black/10 hover:bg-neutral-50 dark:hover:bg-white/5 hover:text-neutral-900 dark:hover:text-white rounded-full transition-all"
-                onClick={(e: React.MouseEvent) => {
-                  e.stopPropagation()
-                  onOpenTaskWizard?.({
-                    chatType,
-                    peerUid: item.id,
-                    peerUin: isGroup
-                      ? item.id
-                      : String((item.raw as Friend).uin || ""),
-                    sessionName: item.name,
-                  })
-                }}
-              >
-                导出
-              </button>
-            )}
+            <button
+              type="button"
+              className="theme-control inline-flex items-center justify-center h-7 px-3 text-[12px] font-medium text-neutral-700 bg-white border border-black/5 shadow-[0_1px_2px_rgba(0,0,0,0.04)] hover:border-black/10 hover:bg-neutral-50 hover:text-neutral-900 rounded-full transition-colors"
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation()
+                onOpenTaskWizard?.({
+                  chatType,
+                  peerUid: item.id,
+                  peerUin: isGroup ? item.id : String((item.raw as Friend).uin || ""),
+                  sessionName: item.name,
+                })
+              }}
+            >
+              导出
+            </button>
           </div>
         )}
       </div>
@@ -417,7 +397,7 @@ function SessionListComponent({
             placeholder="搜索会话名称、备注或 ID..."
             value={search}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearch(e.target.value)}
-            className="h-8 pl-9 pr-8 text-[13px] rounded-full bg-white dark:bg-neutral-900 border border-black/[0.03] dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.02)] hover:border-black/[0.08] focus-visible:ring-0 focus-visible:border-black/[0.12] transition-all"
+            className="theme-control h-8 pl-9 pr-8 text-[13px] rounded-full bg-white border border-black/[0.03] shadow-[0_1px_2px_rgba(0,0,0,0.02)] hover:border-black/[0.08] focus-visible:ring-0 focus-visible:border-black/[0.12]"
           />
           {search && (
             <button
@@ -433,6 +413,7 @@ function SessionListComponent({
         <div className="flex items-center gap-2">
           {/* Type Filter */}
           <PillDropdown
+            frosted
             value={type}
             onChange={(v) => setType(v as SessionType)}
             options={[
@@ -446,6 +427,7 @@ function SessionListComponent({
 
           {/* Sort Field */}
           <PillDropdown
+            frosted
             value={sortField}
             onChange={(v) => setSortField(v as SortField)}
             leadingAction={{
@@ -466,7 +448,9 @@ function SessionListComponent({
 
           {/* Sort Order Toggle */}
           <button
-            className="flex-shrink-0 h-8 w-8 rounded-full bg-white dark:bg-neutral-900 border border-black/[0.03] dark:border-white/10 shadow-[0_1px_2px_rgba(0,0,0,0.02)] flex items-center justify-center text-neutral-600 dark:text-neutral-300 hover:border-black/[0.08] hover:bg-neutral-50 dark:hover:bg-white/5 hover:text-neutral-900 dark:hover:text-white transition-all"
+            type="button"
+            aria-label="切换排序方向"
+            className="theme-control flex-shrink-0 h-8 w-8 rounded-full bg-white border border-black/[0.03] shadow-[0_1px_2px_rgba(0,0,0,0.02)] flex items-center justify-center text-neutral-600 hover:border-black/[0.08] hover:bg-neutral-50 hover:text-neutral-900 transition-colors"
             onClick={handleToggleSort}
           >
             {sortOrder === 'asc' ? (
@@ -531,11 +515,10 @@ function SessionListComponent({
             transition={{ type: "spring", stiffness: 400, damping: 35, mass: 0.8 }}
             data-testid="batch-selection-toolbar"
             className={[
-              "sticky z-50 mx-auto mt-3 w-max max-w-[calc(100vw-2rem)]",
+              "batch-selection-surface frosted-surface sticky z-50 mx-auto mt-3 flex w-max max-w-full flex-wrap items-center justify-center gap-1 rounded-[24px] px-2 py-1.5",
               totalPages > 1 ? "bottom-16 mb-2" : "bottom-8",
             ].join(" ")}
           >
-            <div className="flex max-w-full flex-wrap items-center justify-center gap-1 rounded-[24px] bg-white/80 dark:bg-neutral-900/80 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.08)] border border-black/[0.06] dark:border-white/[0.08] px-2 py-1.5">
               <span className="text-[13px] font-medium text-foreground px-3 tabular-nums">
                 已选择 {selectedItems.size} 项
               </span>
@@ -592,17 +575,17 @@ function SessionListComponent({
               <button
                 onClick={onOpenBatchExportDialog}
                 disabled={selectedItems.size === 0}
-                className="px-4 py-1.5 text-[13px] font-medium text-white bg-[#317CFF] rounded-full hover:bg-[#2867d6] transition-colors disabled:opacity-40 disabled:pointer-events-none"
+                className="px-4 py-1.5 text-[13px] font-medium text-primary-foreground bg-primary rounded-full hover:bg-primary/90 transition-colors disabled:opacity-40 disabled:pointer-events-none"
               >
                 设置并导出
               </button>
               <button
                 onClick={onToggleBatchMode}
+                aria-label="取消批量选择"
                 className="p-1.5 text-muted-foreground hover:text-foreground rounded-full hover:bg-black/[0.04] dark:hover:bg-white/[0.06] transition-colors ml-1"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
-            </div>
           </motion.div>
         )}
       </AnimatePresence>

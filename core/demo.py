@@ -1,5 +1,6 @@
 """Fictional, self-contained demo. Never opens WeChat data."""
 from datetime import datetime
+from wx4 import WECHAT_TIME_ZONE
 
 SESSIONS = [
     ('demo_design@chatroom', '周末出走计划', '群聊', '照片收到了，这次的日落真的很美。', '山'),
@@ -20,14 +21,14 @@ class DemoArchive:
         return any(username == session[0] for session in SESSIONS)
 
     def sessions(self):
-        base = int(datetime(2026, 10, 30, 15, 30).timestamp())
+        base = int(datetime(2026, 10, 30, 15, 30, tzinfo=WECHAT_TIME_ZONE).timestamp())
         return [dict(username=u, display=n, summary=s, is_group=u.endswith('@chatroom'),
                      last_time=base-i*2700, sort_time=base-i*2700, has_messages=True,
                      unread=0, initial=a) for i, (u, n, t, s, a) in enumerate(SESSIONS)]
 
     def messages(self, session, options=None, descending=False, before=None, cancel=None, on_scan=None):
         options = options or {}
-        base = int(datetime(2026, 10, 30, 10, 10).timestamp())
+        base = int(datetime(2026, 10, 30, 10, 10, tzinfo=WECHAT_TIME_ZONE).timestamp())
         text = [
             ('林间', '周末的天气看起来不错，去山里走走吧？', False),
             ('我', '好呀！上次收藏的那条路线正好可以安排上。', True),
@@ -51,7 +52,7 @@ class DemoArchive:
             if options.get('query', '').casefold() not in (sender+' '+content).casefold(): continue
             rows.append(dict(local_id=i+1, server_id=str(i+1), shard=0, type=3 if kind=='image' else 1,
                              type_name='图片' if kind=='image' else '文本', create_time=ts,
-                             time_str=datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'),
+                             time_str=datetime.fromtimestamp(ts, WECHAT_TIME_ZONE).strftime('%Y-%m-%d %H:%M:%S'),
                              sender=sender, sender_wxid='demo_me' if me else 'demo_friend',
                              is_sender=me, text=content, content=content, kind=kind, extra={},
                              session=session, _cursor=key))
